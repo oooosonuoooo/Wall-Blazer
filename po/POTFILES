@@ -1,0 +1,7 @@
+data/com.wallblazer.WallBlazer.desktop.in
+data/com.wallblazer.WallBlazer.appdata.xml.in
+data/com.wallblazer.WallBlazer.gschema.xml
+src/window.ui
+src/main.py
+src/window.py
+
