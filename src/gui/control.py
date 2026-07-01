@@ -1264,12 +1264,11 @@ class ControlPanel(Gtk.Application):
         spin = self.builder.get_object("SpinPlaylistInterval")
         if spin:
             interval_sec = max(0, int(self.config.get(CONFIG_KEY_PLAYLIST_INTERVAL, 300)))
-            spin.set_value(interval_sec / 60 if interval_sec > 0 else 0)
-            # Allow 0 minimum in the underlying adjustment
             adj = spin.get_adjustment()
             if adj:
                 adj.set_lower(0)
                 adj.set_step_increment(1)
+            spin.set_value(interval_sec / 60 if interval_sec > 0 else 0)
             spin.set_tooltip_text(
                 "Minutes between playlist advances.\n"
                 "0 = advance automatically when each video ends"
