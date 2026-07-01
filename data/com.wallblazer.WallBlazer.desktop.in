@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Wall Blazer
+Exec=wallblazer
+Icon=com.wallblazer.WallBlazer
+Terminal=false
+Type=Application
+Categories=GTK;Utility;
+StartupNotify=true
