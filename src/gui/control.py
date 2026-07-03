@@ -411,7 +411,7 @@ class VideoGridTile(Gtk.FlowBoxChild):
 
     def start(self):
         if self._disposed or self._thumb_requested:
-            return
+            return False
         self._thumb_requested = True
         request_thumbnail_pixbuf(
             self.video_path,
@@ -419,6 +419,7 @@ class VideoGridTile(Gtk.FlowBoxChild):
             height=self._thumb_height,
             on_ready=self._on_thumbnail_ready,
         )
+        return True
 
     def stop(self):
         self._stop_preview_animation()
@@ -556,7 +557,8 @@ class VideoGridTile(Gtk.FlowBoxChild):
 
 
 class ControlPanel(Gtk.Application):
-    _THUMBNAIL_WARMUP_MAX = 24
+    _THUMBNAIL_WARMUP_MAX = 96
+    _THUMBNAIL_WARMUP_INTERVAL_MS = 120
 
     def __init__(self, version, *args, **kwargs):
         super().__init__(
@@ -617,6 +619,7 @@ class ControlPanel(Gtk.Application):
 
         # Local-video grid playback
         self._video_tiles = {}
+        self._video_grid_warmup_source_id = None
         # Per-monitor playlist tab state
         self._playlist_selected_monitor = None   # currently selected monitor name in ListBox
         self._playlist_store = None              # GtkListStore for TreeViewPlaylist
@@ -1032,15 +1035,30 @@ class ControlPanel(Gtk.Application):
         return stack is not None and stack.get_visible_child_name() == "video"
 
     def _schedule_video_grid_warmup(self):
-        for delay_ms in (150, 600, 1500):
-            GLib.timeout_add(delay_ms, self._start_video_grid_playback_once)
+        if self._video_grid_warmup_source_id is not None:
+            return
+        self._video_grid_warmup_source_id = GLib.timeout_add(
+            self._THUMBNAIL_WARMUP_INTERVAL_MS,
+            self._start_video_grid_playback_once,
+        )
 
     def _start_video_grid_playback_once(self):
-        if self._is_video_tab_visible():
-            self._start_video_grid_playback()
-        return False
+        if not self._is_video_tab_visible():
+            self._video_grid_warmup_source_id = None
+            return False
+        has_pending = self._start_video_grid_playback()
+        if not has_pending:
+            self._video_grid_warmup_source_id = None
+        return has_pending
 
     def _clear_video_grid(self):
+        if self._video_grid_warmup_source_id is not None:
+            try:
+                GLib.source_remove(self._video_grid_warmup_source_id)
+            except Exception:
+                pass
+            self._video_grid_warmup_source_id = None
+
         for tile in self._video_tiles.values():
             cleanup = getattr(tile, "cleanup", None)
             if callable(cleanup):
@@ -1059,15 +1077,25 @@ class ControlPanel(Gtk.Application):
 
     def _start_video_grid_playback(self):
         started = 0
+        has_pending = False
         for tile in self._video_tiles.values():
+            if getattr(tile, "_thumb_requested", False):
+                continue
+            has_pending = True
             if started >= self._THUMBNAIL_WARMUP_MAX:
                 break
             start = getattr(tile, "start", None)
-            if callable(start):
-                start()
+            if callable(start) and start():
                 started += 1
+        return has_pending
 
     def _stop_video_grid_playback(self):
+        if self._video_grid_warmup_source_id is not None:
+            try:
+                GLib.source_remove(self._video_grid_warmup_source_id)
+            except Exception:
+                pass
+            self._video_grid_warmup_source_id = None
         for tile in self._video_tiles.values():
             stop = getattr(tile, "stop", None)
             if callable(stop):

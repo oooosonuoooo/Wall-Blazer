@@ -2,10 +2,13 @@ import os
 import sys
 import hashlib
 import logging
+import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import gi
+gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, GLib
 
 try:
@@ -35,10 +38,42 @@ def _ensure_cache_dir(path: str) -> str:
 
 
 THUMB_CACHE_DIR = _ensure_cache_dir(_DEFAULT_THUMB_CACHE_DIR)
-# Allow only 2 concurrent thumbnail jobs to avoid competing with the VLC wallpaper process
-THUMBNAIL_SEMAPHORE = threading.Semaphore(2)
-# Small pool — thumbnails run in background, wallpaper playback takes priority
-THUMBNAIL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wb-thumb")
+
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+_CPU_COUNT = os.cpu_count() or 4
+THUMBNAIL_WORKERS = _env_int(
+    "WALLBLAZER_THUMBNAIL_WORKERS",
+    default=min(8, max(4, _CPU_COUNT + 2)),
+    min_value=1,
+    max_value=16,
+)
+THUMBNAIL_TIMEOUT_SEC = _env_int(
+    "WALLBLAZER_THUMBNAIL_TIMEOUT_SEC",
+    default=8,
+    min_value=2,
+    max_value=60,
+)
+THUMBNAIL_SIZE = _env_int(
+    "WALLBLAZER_THUMBNAIL_SIZE",
+    default=320,
+    min_value=96,
+    max_value=1024,
+)
+
+# Keep generation bounded, but use enough workers that large video folders warm quickly.
+THUMBNAIL_SEMAPHORE = threading.Semaphore(THUMBNAIL_WORKERS)
+THUMBNAIL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=THUMBNAIL_WORKERS,
+    thread_name_prefix="wb-thumb",
+)
 
 
 def _thumb_path_for(video_path: str) -> str:
@@ -52,38 +87,71 @@ def _thumb_path_for(video_path: str) -> str:
     return os.path.join(THUMB_CACHE_DIR, key + ".png")
 
 
-def _probe_duration_seconds(filename: str) -> float:
+def _is_valid_thumb(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _tmp_thumb_path(thumb: str) -> str:
+    return f"{thumb}.tmp-{os.getpid()}-{threading.get_ident()}.png"
+
+
+def _run_thumbnail_command(cmd: list[str], thumb: str) -> bool:
+    tmp_thumb = _tmp_thumb_path(thumb)
+    run_cmd = [tmp_thumb if arg == "{output}" else arg for arg in cmd]
     try:
-        out = subprocess.check_output(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                filename,
-            ],
-            stderr=subprocess.STDOUT,
-            timeout=8,
-            text=True,
-        ).strip()
-        value = float(out)
-        return value if value > 0 else 0.0
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-        return 0.0
+        ret = subprocess.run(
+            run_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=THUMBNAIL_TIMEOUT_SEC,
+            check=False,
+        )
+        if ret.returncode == 0 and _is_valid_thumb(tmp_thumb):
+            os.replace(tmp_thumb, thumb)
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug(f"[Thumbnail] command failed for {cmd[0]}: {e}")
+    finally:
+        if os.path.exists(tmp_thumb):
+            try:
+                os.remove(tmp_thumb)
+            except OSError:
+                pass
+    return False
 
 
-def _thumbnail_commands(filename: str, thumb: str, duration_sec: float):
+def _generate_with_ffmpegthumbnailer(filename: str, thumb: str) -> bool:
+    if shutil.which("ffmpegthumbnailer") is None:
+        return False
+    cmd = [
+        "ffmpegthumbnailer",
+        "-i", filename,
+        "-o", "{output}",
+        "-s", str(THUMBNAIL_SIZE),
+        "-c", "png",
+        "-t", "10",
+        "-q", "8",
+    ]
+    return _run_thumbnail_command(cmd, thumb)
+
+
+def _ffmpeg_thumbnail_commands(filename: str):
     common = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    filters = "thumbnail,scale=320:-1:flags=lanczos"
+    filters = f"scale={THUMBNAIL_SIZE}:-1:flags=fast_bilinear"
+    return [
+        common + ["-ss", "1", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
+        common + ["-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
+        common + ["-ss", "0", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
+    ]
 
-    cmds = []
-    if duration_sec > 0.0:
-        seek = max(0.0, min(duration_sec * 0.2, duration_sec - 0.05))
-        cmds.append(common + ["-ss", f"{seek:.3f}", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, thumb])
-    cmds.append(common + ["-ss", "1", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, thumb])
-    cmds.append(common + ["-i", filename, "-frames:v", "1", "-an", "-vf", filters, thumb])
-    cmds.append(common + ["-ss", "0", "-i", filename, "-frames:v", "1", "-an", "-vf", "scale=320:-1:flags=lanczos", thumb])
-    return cmds
+
+def _generate_with_ffmpeg(filename: str, thumb: str) -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+    for cmd in _ffmpeg_thumbnail_commands(filename):
+        if _run_thumbnail_command(cmd, thumb):
+            return True
+    return False
 
 
 def generate_thumbnail(filename: str) -> str | None:
@@ -93,28 +161,16 @@ def generate_thumbnail(filename: str) -> str | None:
     The thumbnail is cached on disk so it's only generated once.
     """
     thumb = _thumb_path_for(filename)
-    if os.path.exists(thumb):
+    if _is_valid_thumb(thumb):
         return thumb
 
-    duration_sec = _probe_duration_seconds(filename)
     try:
-        for cmd in _thumbnail_commands(filename, thumb, duration_sec):
-            ret = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=25,
-                check=False,
-            )
-            if ret.returncode == 0 and os.path.exists(thumb):
-                return thumb
-            if os.path.exists(thumb):
-                try:
-                    os.remove(thumb)
-                except OSError:
-                    pass
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"[Thumbnail] ffmpeg failed for {filename}: {e}")
+        if _generate_with_ffmpegthumbnailer(filename, thumb):
+            return thumb
+        if _generate_with_ffmpeg(filename, thumb):
+            return thumb
+    except OSError as e:
+        logger.debug(f"[Thumbnail] failed for {filename}: {e}")
     return None
 
 
@@ -146,11 +202,13 @@ def get_thumbnail(video_path: str, list_store, idx: int):
 def get_thumbnail_pixbuf(video_path: str, width: int = 240, height: int = 135):
     """Load (or generate) a cached static thumbnail pixbuf for a video file."""
     try:
-        with THUMBNAIL_SEMAPHORE:
-            thumb = generate_thumbnail(video_path)
-            if thumb is None:
-                return None
-            return GdkPixbuf.Pixbuf.new_from_file_at_size(thumb, width, height)
+        thumb = _thumb_path_for(video_path)
+        if not _is_valid_thumb(thumb):
+            with THUMBNAIL_SEMAPHORE:
+                thumb = generate_thumbnail(video_path)
+        if thumb is None or not _is_valid_thumb(thumb):
+            return None
+        return GdkPixbuf.Pixbuf.new_from_file_at_size(thumb, width, height)
     except Exception as e:
         logger.debug(f"[Thumbnail] Failed to load pixbuf for {video_path}: {e}")
     return None
