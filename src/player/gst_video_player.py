@@ -35,22 +35,24 @@ _GPU_DECODER_FACTORIES = {
     "hevc": "nvh265dec",
     "vp9": "nvvp9dec",
 }
-_GPU_FILTER_ELEMENTS = ("gtkglsink", "glupload", "glcolorconvert", "glcolorbalance", "glshader")
-_GPU_GAMMA_FRAGMENT = """
-uniform sampler2D tex;
-uniform float gamma_value;
-varying vec2 v_texcoord;
-
-void main () {
-    vec4 rgba = texture2D(tex, v_texcoord);
-    float safe_gamma = max(gamma_value, 0.01);
-    rgba.rgb = pow(max(rgba.rgb, vec3(0.0)), vec3(1.0 / safe_gamma));
-    gl_FragColor = rgba;
-}
-"""
+_GPU_FILTER_ELEMENTS = ("gtkglsink", "glupload", "glcolorconvert", "glcolorbalance")
 
 
-def _gpu_decoder_for_source(source):
+def _gpu_adjustments_allow_path(adjustments):
+    """Keep the GPU path only when its color controls are fully supported."""
+    if not isinstance(adjustments, dict):
+        return True
+    try:
+        gamma = float(adjustments.get("gamma", 1.0))
+    except (TypeError, ValueError):
+        gamma = 1.0
+    # glcolorbalance covers brightness/contrast/saturation/hue.  Gamma is
+    # intentionally left to the original CPU element until a driver-safe GL
+    # shader implementation is available.
+    return abs(gamma - 1.0) < 1e-3
+
+
+def _gpu_decoder_for_source(source, adjustments=None):
     """Return the NVIDIA decoder factory for a locally supported video source."""
     gpu_setting = str(os.environ.get("WALLBLAZER_GPU_FILTERS", "auto")).strip().lower()
     if gpu_setting in {"0", "false", "off", "no"}:
@@ -58,6 +60,8 @@ def _gpu_decoder_for_source(source):
     if str(os.environ.get("WALLBLAZER_FORCE_HWDEC", "")).strip().lower() == "none":
         return None
     if not isinstance(source, str) or not os.path.isfile(source):
+        return None
+    if not _gpu_adjustments_allow_path(adjustments):
         return None
 
     gpu_profile = get_vlc_hwdec_profile()
@@ -85,31 +89,22 @@ def _build_gpu_filter_bin():
     upload = Gst.ElementFactory.make("glupload", None)
     convert = Gst.ElementFactory.make("glcolorconvert", None)
     balance = Gst.ElementFactory.make("glcolorbalance", None)
-    gamma = Gst.ElementFactory.make("glshader", None)
-    if any(element is None for element in (upload, convert, balance, gamma)):
-        return None, None, None
-
-    try:
-        gamma.set_property("fragment", _GPU_GAMMA_FRAGMENT)
-        uniforms = Gst.Structure.new_empty("uniforms")
-        uniforms.set_value("gamma_value", 1.0)
-        gamma.set_property("uniforms", uniforms)
-    except Exception:
+    if any(element is None for element in (upload, convert, balance)):
         return None, None, None
 
     filter_bin = Gst.Bin.new("wallblazer-gpu-video-filter")
-    for element in (upload, convert, balance, gamma):
+    for element in (upload, convert, balance):
         filter_bin.add(element)
-    if not upload.link(convert) or not convert.link(balance) or not balance.link(gamma):
+    if not upload.link(convert) or not convert.link(balance):
         return None, None, None
 
     sink_pad = upload.get_static_pad("sink")
-    src_pad = gamma.get_static_pad("src")
+    src_pad = balance.get_static_pad("src")
     if sink_pad is None or src_pad is None:
         return None, None, None
     filter_bin.add_pad(Gst.GhostPad.new("sink", sink_pad))
     filter_bin.add_pad(Gst.GhostPad.new("src", src_pad))
-    return filter_bin, balance, gamma
+    return filter_bin, balance, None
 
 
 def _build_cpu_filter_bin(video_balance, gamma_element):
@@ -285,7 +280,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
                 self._using_gpu_filters = True
                 logger.info(
                     f"[Gst] GPU path enabled: decoder={gpu_decoder} "
-                    "NVDEC -> GL color/gamma -> gtkglsink"
+                    "NVDEC -> GL color -> gtkglsink"
                 )
 
         if not self._using_gpu_filters:
@@ -609,18 +604,18 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             except Exception as e:
                 logger.debug(f"[Gst] Could not apply videobalance adjustments: {e}")
 
-        # Apply gamma inside the video pipeline.  The GPU path uses a small
-        # fragment shader so it never downloads frames for this adjustment.
-        if self._gpu_gamma_shader is not None:
-            try:
-                gst_gamma = self._clamp(float(values.get("gamma", 1.0)), 0.01, 10.0)
-                uniforms = Gst.Structure.new_empty("uniforms")
-                uniforms.set_value("gamma_value", gst_gamma)
-                self._gpu_gamma_shader.set_property("uniforms", uniforms)
-                self._last_gamma_value = gst_gamma
-            except Exception as e:
-                logger.debug(f"[Gst] Could not apply GPU gamma adjustment: {e}")
-        elif self._gamma_element is not None:
+        # The GPU path intentionally stays on a neutral gamma value.  A
+        # non-neutral gamma selects the original CPU gamma element because the
+        # driver-safe GL shader variant previously produced clipped colors on
+        # this machine.
+        if self._using_gpu_filters and not _gpu_adjustments_allow_path(values):
+            self._switch_render_path(None)
+        elif not self._using_gpu_filters and self._active_media is not None:
+            gpu_decoder = _gpu_decoder_for_source(self._active_media.source, values)
+            if gpu_decoder:
+                self._switch_render_path(gpu_decoder)
+
+        if self._gamma_element is not None:
             try:
                 # GStreamer gamma element range: 0.01 .. 10.0  (1.0 = neutral)
                 gst_gamma = self._clamp(float(values.get("gamma", 1.0)), 0.01, 10.0)
@@ -687,7 +682,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def set_media(self, media):
         if media is None:
             return
-        self._switch_render_path(_gpu_decoder_for_source(media.source))
+        self._switch_render_path(
+            _gpu_decoder_for_source(media.source, self._video_adjustments)
+        )
         self._active_media = media
         self._rate_applied = False
         self._player.set_state(Gst.State.NULL)
@@ -927,7 +924,7 @@ class GstVideoPlayer(VideoPlayer):
         source = data_source.get(gdk_monitor.get_model(), "")
         if not isinstance(source, str) or not source:
             source = data_source.get("Default", "")
-        return _gpu_decoder_for_source(source)
+        return _gpu_decoder_for_source(source, self._video_adjustment_values())
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
