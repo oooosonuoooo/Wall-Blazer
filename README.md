@@ -63,7 +63,7 @@
   <li><strong>Seamless Playlist Switching:</strong> Preloads the next video in the background and switches ~0.5 seconds early to eliminate flickering and ensure instant transitions.</li>
   <li><strong>Custom Playlists:</strong> Create multiple named playlists, assign them to specific monitors, and customize intervals and shuffle modes.</li>
   <li><strong>Per-Mode Playback Speed:</strong> Tune single wallpaper speed, playlist forward speed, and reverse speed independently from <code>0.25x</code> to <code>4x</code>.</li>
-  <li><strong>GPU-First Playback:</strong> Automatically utilizes hardware decoding (VAAPI/VDPAU/DRM/auto) to save battery, gracefully falling back to CPU if no stable GPU path is found.</li>
+  <li><strong>GPU-First Playback:</strong> Automatically uses CUDA/NVDEC plus GL rendering for supported H.264/HEVC/VP9 video on NVIDIA, then falls back to VAAPI/VDPAU/DRM/CPU as needed. Unsupported codecs (for example AV1 on older GPUs) stay on the compatible CPU path. Set <code>WALLBLAZER_FORCE_HWDEC=none</code> to opt out.</li>
   <li><strong>Broad Video Preview:</strong> Employs multiple extraction strategies to generate previews even for difficult codecs and containers.</li>
 </ul>
 

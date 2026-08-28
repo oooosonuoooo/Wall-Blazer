@@ -972,8 +972,11 @@ def get_vlc_hwdec_profile(force_refresh=False):
     """
     Build a VLC hw-decode profile:
     - Prefer GPU decode when available.
-    - Fall back to CPU decode (`none`) when no stable hw backend is detected.
+    - Fall back to CPU decode (`none`) when no usable hw backend is detected.
+    - Prefer NVIDIA CUDA/NVDEC on hybrid systems so video decode stays on the
+      discrete GPU instead of consuming multiple CPU cores.
     Environment override: WALLBLAZER_FORCE_HWDEC (e.g. any|none|vaapi|vdpau|drm).
+    Set WALLBLAZER_FORCE_HWDEC=none to opt out of hardware decoding.
     """
     global _GPU_PROFILE_CACHE
     if _GPU_PROFILE_CACHE is not None and not force_refresh:
@@ -1011,15 +1014,7 @@ def get_vlc_hwdec_profile(force_refresh=False):
     has_nvidia = "nvidia" in vendors
     has_intel_amd = ("intel" in vendors) or ("amd" in vendors)
 
-    allow_hybrid_hwdec = _truthy_env("WALLBLAZER_ALLOW_HYBRID_HWDEC")
-
-    if has_nvidia and has_intel_amd and not allow_hybrid_hwdec:
-        hwdec = "none"
-        reason = (
-            "Hybrid NVIDIA setup detected; defaulting to stable CPU decode. "
-            "Set WALLBLAZER_ALLOW_HYBRID_HWDEC=1 to opt into GPU decode."
-        )
-    elif has_nvidia:
+    if has_nvidia:
         # Prefer CUDA/NVDEC first on NVIDIA setups. "any" can pick VDPAU on
         # hybrid systems, which is less stable and can produce black output.
         if "cuda" in methods:
