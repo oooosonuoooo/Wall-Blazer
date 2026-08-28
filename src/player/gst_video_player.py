@@ -112,6 +112,22 @@ def _build_gpu_filter_bin():
     return filter_bin, balance, gamma
 
 
+def _build_cpu_filter_bin(video_balance, gamma_element):
+    """Build the compatibility video filter used by the original renderer."""
+    if video_balance is not None and gamma_element is not None:
+        filter_bin = Gst.Bin.new("wallblazer-video-filter")
+        filter_bin.add(video_balance)
+        filter_bin.add(gamma_element)
+        video_balance.link(gamma_element)
+        sink_pad = video_balance.get_static_pad("sink")
+        src_pad = gamma_element.get_static_pad("src")
+        if sink_pad is not None and src_pad is not None:
+            filter_bin.add_pad(Gst.GhostPad.new("sink", sink_pad))
+            filter_bin.add_pad(Gst.GhostPad.new("src", src_pad))
+            return filter_bin
+    return video_balance
+
+
 class Fade:
     def __init__(self):
         self.timer = None
@@ -252,8 +268,10 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._using_gpu_filters = False
         self._gpu_filter = None
         self._gpu_gamma_shader = None
+        self._gpu_decoder = None
         self._video_balance = None
         self._gamma_element = None
+        self._video_filter = None
 
         if gpu_decoder:
             gpu_sink = Gst.ElementFactory.make("gtkglsink", None)
@@ -263,6 +281,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
                 self._gpu_filter = gpu_filter
                 self._video_balance = gpu_balance
                 self._gpu_gamma_shader = gpu_gamma
+                self._gpu_decoder = gpu_decoder
                 self._using_gpu_filters = True
                 logger.info(
                     f"[Gst] GPU path enabled: decoder={gpu_decoder} "
@@ -294,22 +313,18 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             raise RuntimeError("playbin is unavailable")
         self._player.set_property("video-sink", self._sink)
         if self._using_gpu_filters:
+            self._video_filter = self._gpu_filter
             self._player.set_property("video-filter", self._gpu_filter)
         # Chain videobalance -> gamma inside a bin so all colour/gamma adjustments
         # are applied purely to the video stream.  This prevents any path where
         # gamma would fall through to the X11 display gamma ramp (XF86VidMode).
         elif self._video_balance is not None and self._gamma_element is not None:
-            filter_bin = Gst.Bin.new("wallblazer-video-filter")
-            filter_bin.add(self._video_balance)
-            filter_bin.add(self._gamma_element)
-            self._video_balance.link(self._gamma_element)
-            # Ghost pads so playbin sees a single element
-            sink_pad = self._video_balance.get_static_pad("sink")
-            src_pad = self._gamma_element.get_static_pad("src")
-            filter_bin.add_pad(Gst.GhostPad.new("sink", sink_pad))
-            filter_bin.add_pad(Gst.GhostPad.new("src", src_pad))
-            self._player.set_property("video-filter", filter_bin)
+            self._video_filter = _build_cpu_filter_bin(
+                self._video_balance, self._gamma_element
+            )
+            self._player.set_property("video-filter", self._video_filter)
         elif self._video_balance is not None:
+            self._video_filter = self._video_balance
             self._player.set_property("video-filter", self._video_balance)
 
         self._viewport = Gtk.Fixed()
@@ -360,6 +375,102 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
                 widget.override_background_color(Gtk.StateFlags.NORMAL, rgba)
             except Exception:
                 pass
+
+    def _prepare_video_widget(self, sink):
+        try:
+            sink.set_property("force-aspect-ratio", False)
+        except Exception:
+            pass
+        try:
+            widget = sink.get_property("widget")
+        except Exception:
+            return None
+        if widget is None:
+            return None
+        try:
+            widget.set_hexpand(True)
+            widget.set_vexpand(True)
+            widget.set_size_request(self.width, self.height)
+        except Exception:
+            return None
+        return widget
+
+    def _switch_render_path(self, gpu_decoder):
+        """Switch sinks when a playlist source changes codec capabilities."""
+        use_gpu = bool(gpu_decoder)
+        if use_gpu == self._using_gpu_filters:
+            return True
+
+        if use_gpu:
+            new_sink = Gst.ElementFactory.make("gtkglsink", None)
+            new_filter, new_balance, new_gamma_shader = _build_gpu_filter_bin()
+            if new_sink is None or new_filter is None:
+                logger.warning("[Gst] GPU path unavailable; retaining compatibility renderer")
+                return False
+            new_gpu_filter = new_filter
+            new_video_filter = new_filter
+            new_gamma_element = None
+        else:
+            new_sink = Gst.ElementFactory.make("gtksink")
+            if new_sink is None:
+                logger.warning("[Gst] Compatibility sink unavailable; retaining current renderer")
+                return False
+            new_balance = Gst.ElementFactory.make("videobalance")
+            new_gamma_element = Gst.ElementFactory.make("gamma")
+            new_video_filter = _build_cpu_filter_bin(new_balance, new_gamma_element)
+            new_gpu_filter = None
+            new_gamma_shader = None
+
+        new_widget = self._prepare_video_widget(new_sink)
+        if new_widget is None:
+            logger.warning("[Gst] New video widget unavailable; retaining current renderer")
+            return False
+
+        old_sink = self._sink
+        old_filter = self._video_filter
+        old_widget = self._video_widget
+        try:
+            self._player.set_state(Gst.State.NULL)
+            self._player.set_property("video-sink", new_sink)
+            self._player.set_property("video-filter", new_video_filter)
+            if old_widget is not None and old_widget.get_parent() is self._viewport:
+                self._viewport.remove(old_widget)
+            self._viewport.put(new_widget, 0, 0)
+            new_widget.show()
+        except Exception as e:
+            try:
+                self._player.set_state(Gst.State.NULL)
+                self._player.set_property("video-sink", old_sink)
+                self._player.set_property("video-filter", old_filter)
+            except Exception:
+                pass
+            try:
+                if new_widget.get_parent() is self._viewport:
+                    self._viewport.remove(new_widget)
+                if old_widget is not None and old_widget.get_parent() is None:
+                    self._viewport.put(old_widget, 0, 0)
+                    old_widget.show()
+            except Exception:
+                pass
+            logger.warning(f"[Gst] Renderer switch failed; retained current path: {e}")
+            return False
+
+        self._sink = new_sink
+        self._video_widget = new_widget
+        self._video_filter = new_video_filter
+        self._gpu_filter = new_gpu_filter
+        self._gpu_gamma_shader = new_gamma_shader
+        self._gpu_decoder = gpu_decoder if use_gpu else None
+        self._video_balance = new_balance
+        self._gamma_element = new_gamma_element
+        self._using_gpu_filters = use_gpu
+        self.apply_video_adjustments(self._video_adjustments)
+        self.schedule_centercrop(*self._last_dimensions)
+        logger.info(
+            f"[Gst] Switched renderer to {'GPU' if use_gpu else 'CPU'} path"
+            + (f" ({gpu_decoder})" if use_gpu else "")
+        )
+        return True
 
     @staticmethod
     def _source_to_uri(source):
@@ -576,6 +687,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def set_media(self, media):
         if media is None:
             return
+        self._switch_render_path(_gpu_decoder_for_source(media.source))
         self._active_media = media
         self._rate_applied = False
         self._player.set_state(Gst.State.NULL)
