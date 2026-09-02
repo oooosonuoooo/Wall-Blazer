@@ -9,6 +9,7 @@ import time
 import threading
 import hashlib
 import multiprocessing as mp
+import importlib.util
 from multiprocessing import Process
 import setproctitle
 
@@ -100,6 +101,24 @@ _REVERSE_X264_PRESET = "medium"
 _REVERSE_X264_CRF = "16"
 
 
+def _is_x11_session():
+    session_type = str(os.environ.get("XDG_SESSION_TYPE", "")).strip().lower()
+    if session_type == "x11":
+        return True
+    if session_type == "wayland":
+        return False
+    # Some display managers do not export XDG_SESSION_TYPE.  In that case an
+    # X display without a Wayland socket is the best available signal.
+    return bool(os.environ.get("DISPLAY")) and not bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _vlc_video_player_available():
+    try:
+        return importlib.util.find_spec("vlc") is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
 def _prefer_gstreamer_video_backend():
     gst_available = bool(gst_video_player_available or (globals().get("gst_video_player_main") is not None))
     backend = str(os.environ.get("WALLBLAZER_VIDEO_BACKEND", "auto")).strip().lower()
@@ -109,8 +128,12 @@ def _prefer_gstreamer_video_backend():
         return gst_available
     if not gst_available or sys.platform == "win32":
         return False
-    # Prefer GStreamer in auto mode on Linux to avoid VLC embed black-screen
-    # regressions seen on some desktop/driver combinations.
+    # VLC's X11 renderer is substantially lighter than gtkglsink on NVIDIA
+    # systems and has reliable wallpaper embedding there.  Keep GStreamer as
+    # the automatic fallback on Wayland and when python-vlc is unavailable;
+    # WALLBLAZER_VIDEO_BACKEND=gst remains an explicit escape hatch.
+    if _is_x11_session() and _vlc_video_player_available():
+        return False
     return True
 
 

@@ -22,8 +22,7 @@ try:
     sys.path.insert(1, os.path.join(sys.path[0], '..'))
     from player.base_player import BasePlayer
     from player.fit_geometry import (
-        calculate_center_crop_geometry,
-        format_vlc_crop_geometry,
+        calculate_fit_geometry,
         normalize_fit_mode,
     )
     from ipc import publish_service
@@ -33,8 +32,7 @@ try:
 except (ModuleNotFoundError, ImportError):
     from wallblazer.player.base_player import BasePlayer
     from wallblazer.player.fit_geometry import (
-        calculate_center_crop_geometry,
-        format_vlc_crop_geometry,
+        calculate_fit_geometry,
         normalize_fit_mode,
     )
     from wallblazer.ipc import publish_service
@@ -162,6 +160,30 @@ class Fade:
         if self.timer:
             self.timer.cancel()
             self.timer = None
+
+
+class CropViewport(Gtk.Fixed):
+    """A fixed-size, clipping viewport for an oversize VLC child widget."""
+
+    __gtype_name__ = "WallBlazerCropViewport"
+
+    def __init__(self, width, height):
+        super().__init__()
+        self._viewport_width = max(1, int(width))
+        self._viewport_height = max(1, int(height))
+        self.set_size_request(self._viewport_width, self._viewport_height)
+
+    def set_viewport_size(self, width, height):
+        self._viewport_width = max(1, int(width))
+        self._viewport_height = max(1, int(height))
+        self.set_size_request(self._viewport_width, self._viewport_height)
+        self.queue_resize()
+
+    def do_get_preferred_width(self):
+        return self._viewport_width, self._viewport_width
+
+    def do_get_preferred_height(self):
+        return self._viewport_height, self._viewport_height
 
 
 class VLCWidget(Gtk.EventBox):
@@ -334,8 +356,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.height = height
         self.name = name
         self.__vlc_widget = VLCWidget(width, height)
+        self._viewport = CropViewport(width, height)
+        self._viewport.put(self.__vlc_widget, 0, 0)
         self._overlay = Gtk.Overlay()
-        self._overlay.add(self.__vlc_widget)
+        self._overlay.add(self._viewport)
         self._color_overlay = ColorTintOverlay()
         self._overlay.add_overlay(self._color_overlay)
         self._overlay.set_overlay_pass_through(self._color_overlay, True)
@@ -355,6 +379,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
         self._active_media = None
+        self._media_generation = 0
+        self._end_reached_event_manager = None
+        self._end_reached_event_callback = None
         self._fit_mode = "cover"
         self._playback_rate = 1.0
         self._rate_apply_source_id = None
@@ -362,6 +389,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._video_adjustments = dict(DEFAULT_VIDEO_ADJUSTMENTS)
         self._warned_unsafe_vlc_adjustments = False
         self._is_disposed = False
+
+        self._attach_end_reached_handler()
 
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
@@ -379,10 +408,45 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return None
         return getattr(self.__vlc_widget, "player", None)
 
+    def _attach_end_reached_handler(self):
+        """Forward VLC's end event onto GTK's main loop for instant playlists."""
+        player = self._vlc_player()
+        if player is None:
+            return
+        try:
+            manager = player.event_manager()
+            callback = self._on_media_end_reached
+            manager.event_attach(vlc.EventType.MediaPlayerEndReached, callback)
+            self._end_reached_event_manager = manager
+            self._end_reached_event_callback = callback
+        except Exception as e:
+            logger.warning(f"[Playlist] Could not attach VLC end callback: {e}")
+
+    def _on_media_end_reached(self, _event):
+        # libVLC invokes event callbacks from its own thread.  Do not call
+        # libVLC or GTK from here; dispatch the work onto the GTK main loop.
+        if self._is_disposed:
+            return
+        generation = self._media_generation
+        try:
+            GLib.idle_add(self._dispatch_media_end_reached, generation)
+        except Exception as e:
+            logger.debug(f"[Playlist] Could not schedule VLC end callback: {e}")
+
+    def _dispatch_media_end_reached(self, generation):
+        # A pre-emptive poll transition may have already replaced this media.
+        # Ignore its late event rather than advancing the newly started clip.
+        if self._is_disposed or generation != self._media_generation:
+            return False
+        app = self.get_application()
+        if app is not None and hasattr(app, "on_window_end_reached"):
+            app.on_window_end_reached(self.name)
+        return False
+
     def update_monitor_geometry(self, x, y, width, height):
         self.width = max(1, int(width))
         self.height = max(1, int(height))
-        self.__vlc_widget.set_size_request(self.width, self.height)
+        self._viewport.set_viewport_size(self.width, self.height)
         self.resize(self.width, self.height)
         self.move(int(x), int(y))
         self.schedule_centercrop()
@@ -393,7 +457,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if width != self.width or height != self.height:
             self.width = width
             self.height = height
-            self.__vlc_widget.set_size_request(width, height)
+            self._viewport.set_viewport_size(width, height)
             self.schedule_centercrop()
         return False
 
@@ -542,6 +606,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def set_media(self, *args):
         if args:
             self._active_media = args[0]
+            self._media_generation += 1
         self._clear_vlc_string_option(self.__vlc_widget.player.video_set_aspect_ratio)
         self._clear_vlc_string_option(self.__vlc_widget.player.video_set_crop_geometry)
         self.__vlc_widget.player.set_media(*args)
@@ -631,27 +696,34 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 return False
         logger.debug(f"[CenterCrop] Dimension {video_width}x{video_height}")
 
-        # Keep VLC in autoscale mode so output always fits monitor/window size.
+        # Keep VLC in autoscale mode inside a precisely-sized child widget.  A
+        # Gtk.Fixed viewport then clips the oversize child for cover mode,
+        # which is reliable across VLC output modules and keeps the crop
+        # centered without any letterboxing.
         player.video_set_scale(0)
         fit_mode = self._fit_mode
         if fit_mode == "stretch":
+            self.__vlc_widget.set_size_request(self.width, self.height)
+            self._viewport.move(self.__vlc_widget, 0, 0)
             self._clear_vlc_string_option(player.video_set_crop_geometry)
             player.video_set_aspect_ratio(f"{self.width}:{self.height}")
             return True
 
         self._clear_vlc_string_option(player.video_set_aspect_ratio)
-        if fit_mode == "contain":
-            self._clear_vlc_string_option(player.video_set_crop_geometry)
-            return True
-
-        crop = calculate_center_crop_geometry(self.width, self.height, video_width, video_height)
-        if crop is None:
-            self._clear_vlc_string_option(player.video_set_crop_geometry)
-            return True
-
-        crop_geometry = format_vlc_crop_geometry(crop)
-        logger.debug(f"[CenterCrop] Crop geometry: {crop_geometry}")
-        player.video_set_crop_geometry(crop_geometry)
+        self._clear_vlc_string_option(player.video_set_crop_geometry)
+        geometry = calculate_fit_geometry(
+            self.width,
+            self.height,
+            video_width,
+            video_height,
+            fit_mode,
+        )
+        logger.debug(
+            f"[CenterCrop] {fit_mode} geometry: "
+            f"{geometry.width}x{geometry.height}+{geometry.x}+{geometry.y}"
+        )
+        self.__vlc_widget.set_size_request(geometry.width, geometry.height)
+        self._viewport.move(self.__vlc_widget, geometry.x, geometry.y)
         return True
 
     def schedule_centercrop(self, video_width=None, video_height=None, attempts=18, delay_ms=120):
@@ -690,6 +762,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.fade.cancel()
         self.clear_queued_media()
         self._active_media = None
+        if self._end_reached_event_manager is not None:
+            try:
+                self._end_reached_event_manager.event_detach(vlc.EventType.MediaPlayerEndReached)
+            except Exception:
+                pass
+            self._end_reached_event_manager = None
+            self._end_reached_event_callback = None
         if self._rate_apply_source_id is not None:
             try:
                 GLib.source_remove(self._rate_apply_source_id)

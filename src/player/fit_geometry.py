@@ -5,7 +5,6 @@ from collections import namedtuple
 VALID_FIT_MODES = {"cover", "contain", "stretch"}
 
 FitGeometry = namedtuple("FitGeometry", "width height x y")
-CropGeometry = namedtuple("CropGeometry", "width height x y")
 
 
 def normalize_fit_mode(fit_mode):
@@ -46,32 +45,3 @@ def calculate_fit_geometry(container_width, container_height, video_width, video
     offset_x = int(math.floor((container_width - render_width) / 2.0))
     offset_y = int(math.floor((container_height - render_height) / 2.0))
     return FitGeometry(render_width, render_height, offset_x, offset_y)
-
-
-def calculate_center_crop_geometry(container_width, container_height, video_width, video_height):
-    container_width = _positive_int(container_width)
-    container_height = _positive_int(container_height)
-    video_width = _positive_int(video_width)
-    video_height = _positive_int(video_height)
-
-    container_ratio = container_width / float(container_height)
-    video_ratio = video_width / float(video_height)
-    if abs(container_ratio - video_ratio) <= 1e-3:
-        return None
-
-    if video_ratio > container_ratio:
-        crop_width = max(1, min(video_width, int(math.floor(video_height * container_ratio))))
-        crop_height = video_height
-    else:
-        crop_width = video_width
-        crop_height = max(1, min(video_height, int(math.floor(video_width / container_ratio))))
-
-    offset_x = int(math.floor((video_width - crop_width) / 2.0))
-    offset_y = int(math.floor((video_height - crop_height) / 2.0))
-    return CropGeometry(crop_width, crop_height, offset_x, offset_y)
-
-
-def format_vlc_crop_geometry(crop):
-    if crop is None:
-        return None
-    return f"{crop.width}x{crop.height}+{crop.x}+{crop.y}"
