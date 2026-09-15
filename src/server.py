@@ -8,6 +8,7 @@ import sys
 import time
 import threading
 import hashlib
+import pathlib
 import multiprocessing as mp
 import importlib.util
 from multiprocessing import Process
@@ -99,6 +100,34 @@ logger = logging.getLogger(LOGGER_NAME)
 _REVERSE_FILTER = "reverse"
 _REVERSE_X264_PRESET = "medium"
 _REVERSE_X264_CRF = "16"
+
+
+def _canonical_path(path):
+    """Return a normalized path for safe identity comparisons."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(path))))
+
+
+def _same_path(left, right):
+    left = _canonical_path(left)
+    right = _canonical_path(right)
+    return left is not None and left == right
+
+
+def _same_file_snapshot(before, after):
+    """Ensure a file was not replaced while playback was being stopped."""
+    if before is None or after is None:
+        return False
+    if getattr(before, "st_dev", 0) and getattr(before, "st_ino", 0):
+        return (
+            before.st_dev == after.st_dev
+            and before.st_ino == after.st_ino
+        )
+    return (
+        before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+    )
 
 
 def _is_x11_session():
@@ -241,6 +270,10 @@ class WallBlazerServer(object):
         <method name="apply_video_profile"/>
         <method name="playlist_next"/>
         <method name="feeling_lucky"/>
+        <method name="delete_current_video">
+            <arg type="s" name="expected_path" direction="in"/>
+            <arg type="b" name="deleted" direction="out"/>
+        </method>
         <method name='show_gui'/>
         <method name='quit'/>
         <property name="mode" type="s" access="read"/>
@@ -252,6 +285,7 @@ class WallBlazerServer(object):
         <property name="is_static_wallpaper" type="b" access="readwrite"/>
         <property name="is_pause_when_maximized" type="b" access="readwrite"/>
         <property name="is_mute_when_maximized" type="b" access="readwrite"/>
+        <property name="current_video_path" type="s" access="read"/>
     </interface>
     </node>
     """
@@ -908,6 +942,180 @@ class WallBlazerServer(object):
             self._save_config()
             self.video()
 
+    def _current_video_source(self, prefer_player=True):
+        """Return the local source Wall Blazer currently uses, or an empty string."""
+        data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})
+        if prefer_player:
+            player = get_instance(DBUS_NAME_PLAYER)
+            if player is not None:
+                try:
+                    player_data_source = player.data_source
+                    if isinstance(player_data_source, dict):
+                        data_source = player_data_source
+                except Exception:
+                    pass
+
+        if not isinstance(data_source, dict):
+            return ""
+
+        candidates = [data_source.get("Default")]
+        candidates.extend(
+            value for key, value in data_source.items()
+            if key != "Default"
+        )
+        for source in candidates:
+            if not is_usable_video_path(source):
+                continue
+            return os.path.abspath(os.path.expanduser(source))
+        return ""
+
+    def _remove_deleted_video_references(self, deleted_path):
+        """Remove only the deleted file from persisted wallpaper collections."""
+        changed = False
+
+        def _keep(path):
+            return not _same_path(path, deleted_path)
+
+        data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})
+        if isinstance(data_source, dict):
+            for monitor_name, source in list(data_source.items()):
+                if _same_path(source, deleted_path):
+                    data_source[monitor_name] = ""
+                    changed = True
+
+        for key in (CONFIG_KEY_PLAYLIST_SELECTION,):
+            items = self.config.get(key)
+            if isinstance(items, list):
+                filtered = [item for item in items if _keep(item)]
+                if filtered != items:
+                    self.config[key] = filtered
+                    changed = True
+
+        for key in (
+            CONFIG_KEY_PLAYLIST_LIBRARY,
+            CONFIG_KEY_MONITOR_PLAYLISTS,
+            CONFIG_KEY_REVERSE_PLAYLIST_ITEMS,
+        ):
+            collection = self.config.get(key)
+            if not isinstance(collection, dict):
+                continue
+            for collection_name, items in list(collection.items()):
+                if not isinstance(items, list):
+                    continue
+                filtered = [item for item in items if _keep(item)]
+                if filtered != items:
+                    collection[collection_name] = filtered
+                    changed = True
+
+        return changed
+
+    def _stop_player_for_delete(self):
+        """Stop and reap the player before removing its active media file."""
+        self._quit_player(timeout_sec=0.8)
+        process = self.player_process
+        if process is None:
+            return
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            logger.warning("[Server] Player did not stop before video deletion; terminating it")
+            process.kill()
+            process.join(timeout=2)
+        self.player_process = None
+
+    def _set_idle_after_video_delete(self):
+        data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})
+        if not isinstance(data_source, dict):
+            data_source = {"Default": ""}
+        else:
+            data_source = {
+                key: "" for key in data_source if isinstance(key, str)
+            }
+            data_source.setdefault("Default", "")
+        self.config[CONFIG_KEY_DATA_SOURCE] = data_source
+        self.config[CONFIG_KEY_MODE] = MODE_NULL
+        self._save_config()
+        self._setup_player(MODE_NULL)
+
+    def _restore_or_advance_after_delete_failure(self):
+        self._load_config()
+        if (
+            self.config.get(CONFIG_KEY_MODE) == MODE_VIDEO
+            and self._current_video_source(prefer_player=False)
+        ):
+            self._setup_player(MODE_VIDEO)
+        else:
+            self._set_idle_after_video_delete()
+
+    def _load_replacement_after_delete(self):
+        self._load_config()
+        available_videos = get_video_paths()
+        if available_videos:
+            self.feeling_lucky()
+            self._load_config()
+            if self.config.get(CONFIG_KEY_MODE) == MODE_VIDEO and self._current_video_source(
+                prefer_player=False
+            ):
+                return
+
+            # Headless/test environments may not expose monitor metadata. Keep
+            # the same first-valid-video fallback without leaving a stale mode.
+            data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})
+            if not isinstance(data_source, dict):
+                data_source = {"Default": ""}
+            data_source["Default"] = available_videos[0]
+            self.config[CONFIG_KEY_DATA_SOURCE] = data_source
+            self.config[CONFIG_KEY_MODE] = MODE_VIDEO
+            self._save_config()
+            self._setup_player(MODE_VIDEO)
+            return
+        self._set_idle_after_video_delete()
+
+    def delete_current_video(self, expected_path=""):
+        """Delete the confirmed, currently active local wallpaper video."""
+        self._load_config()
+        if self.config.get(CONFIG_KEY_MODE) != MODE_VIDEO:
+            return False
+
+        current_path = self._current_video_source()
+        if not current_path or (expected_path and not _same_path(current_path, expected_path)):
+            return False
+
+        target = pathlib.Path(current_path)
+        if target.is_symlink() or not target.is_file() or target.is_dir():
+            return False
+        try:
+            before = target.stat()
+        except OSError:
+            return False
+
+        self._stop_player_for_delete()
+        self._load_config()
+        current_after_stop = self._current_video_source(prefer_player=False)
+        if not current_after_stop or not _same_path(current_after_stop, current_path):
+            self._restore_or_advance_after_delete_failure()
+            return False
+
+        target = pathlib.Path(current_after_stop)
+        if target.is_symlink() or not target.is_file() or target.is_dir():
+            self._restore_or_advance_after_delete_failure()
+            return False
+        try:
+            after = target.stat()
+            if not _same_file_snapshot(before, after):
+                self._restore_or_advance_after_delete_failure()
+                return False
+            os.remove(target)
+        except OSError as error:
+            logger.warning("[Delete] Could not remove current wallpaper video: %s", error)
+            self._restore_or_advance_after_delete_failure()
+            return False
+
+        self._remove_deleted_video_references(current_after_stop)
+        self._save_config()
+        self._load_replacement_after_delete()
+        return True
+
     def show_gui(self):
         """Show main GUI in a completely fresh subprocess to avoid GTK+fork segfaults.
         Use the installed wallblazer launcher directly so PYTHONPATH is already correct.
@@ -980,6 +1188,13 @@ class WallBlazerServer(object):
     @property
     def mode(self):
         return self.config[CONFIG_KEY_MODE]
+
+    @property
+    def current_video_path(self):
+        self._load_config()
+        if self.config.get(CONFIG_KEY_MODE) != MODE_VIDEO:
+            return ""
+        return self._current_video_source() or ""
 
     @property
     def volume(self):
