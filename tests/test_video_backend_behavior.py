@@ -171,6 +171,11 @@ class BackendSelectionTests(unittest.TestCase):
         ):
             self.assertTrue(server._prefer_gstreamer_video_backend())
 
+    def test_new_configs_keep_wallpaper_playing_behind_maximized_windows(self):
+        self.assertFalse(
+            server.CONFIG_TEMPLATE[server.CONFIG_KEY_PAUSE_WHEN_MAXIMIZED]
+        )
+
     def test_video_source_update_uses_existing_player_process(self):
         app = server.WallBlazerServer.__new__(server.WallBlazerServer)
         app.config = {

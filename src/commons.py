@@ -116,7 +116,10 @@ CONFIG_TEMPLATE = {
     CONFIG_KEY_VOLUME: 50,
     CONFIG_KEY_STATIC_WALLPAPER: True,
     CONFIG_KEY_BLUR_RADIUS: 5,
-    CONFIG_KEY_PAUSE_WHEN_MAXIMIZED: True,
+    # Keep video wallpaper animating while other windows are maximized.
+    # Pausing here makes the wallpaper appear permanently stuck when the
+    # maximized window is later dismissed.
+    CONFIG_KEY_PAUSE_WHEN_MAXIMIZED: False,
     CONFIG_KEY_MUTE_WHEN_MAXIMIZED: False,
     CONFIG_KEY_FADE_DURATION_SEC: 1.5,
     CONFIG_KEY_FADE_INTERVAL: 0.1,

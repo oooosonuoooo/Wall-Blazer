@@ -1255,7 +1255,7 @@ class ControlPanel(Gtk.Application):
                          self.config.get(CONFIG_KEY_STATIC_WALLPAPER, True),
                          self.on_static_wallpaper_toggled)
         self._wire_check("TogglePauseWhenMaximized",
-                         self.config.get(CONFIG_KEY_PAUSE_WHEN_MAXIMIZED, True),
+                         self.config.get(CONFIG_KEY_PAUSE_WHEN_MAXIMIZED, False),
                          self.on_pause_when_maximized_toggled)
         self._wire_check("ToggleMuteWhenMaximized",
                          self.config.get(CONFIG_KEY_MUTE_WHEN_MAXIMIZED, False),
