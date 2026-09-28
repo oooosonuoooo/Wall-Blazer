@@ -10,7 +10,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from player.fit_geometry import calculate_fit_geometry
-from player.video_player import PlayerWindow
+from player.video_player import PlayerWindow, VideoPlayer
 import server
 
 
@@ -196,6 +196,29 @@ class BackendSelectionTests(unittest.TestCase):
         player.apply_video_config.assert_called_once_with()
         app._restart_playlist_timer.assert_called_once_with()
         app._quit_player.assert_not_called()
+
+    def test_single_video_end_event_recovers_the_current_layer(self):
+        recover = Mock()
+        trace = Mock()
+        monitor = SimpleNamespace(get_model=lambda: "HDMI-0")
+        window = SimpleNamespace(
+            has_direct_switch_pending=lambda: False,
+            keep_current_media_playing=recover,
+        )
+        player = SimpleNamespace(
+            mode=server.MODE_VIDEO,
+            _find_monitor_window=lambda name: (monitor, window),
+            _reverse_state={},
+            _get_source_for_monitor=lambda name, sources: "/tmp/current.mp4",
+            config={server.CONFIG_KEY_DATA_SOURCE: {"Default": "/tmp/current.mp4"}},
+            _needs_transition_for_monitor=lambda name, source: False,
+            _trace_transition=trace,
+        )
+
+        self.assertFalse(VideoPlayer.on_window_end_reached(player, "HDMI-0"))
+        recover.assert_called_once_with()
+        trace.assert_called_once()
+        self.assertEqual(trace.call_args.args[0], "loop_recovery")
 
 
 if __name__ == "__main__":

@@ -386,6 +386,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._end_reached_event_manager = None
         self._end_reached_event_callback = None
         self.__preload_widget = None
+        self._preload_warmup_source_id = None
         self._preload_timer_id = None
         self._preload_generation = 0
         self._preload_source = None
@@ -407,6 +408,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._is_disposed = False
 
         self._attach_end_reached_handler()
+        # Build the parked GPU/VLC layer while the wallpaper window is being
+        # created. Creating a second libVLC instance on the first user- or
+        # playlist-triggered switch can otherwise briefly contend with the
+        # active X11 render loop.
+        try:
+            self._ensure_preload_widget()
+            self._preload_warmup_source_id = GLib.timeout_add(
+                50,
+                self._warm_preload_widget,
+            )
+        except Exception as e:
+            # Keep the compatibility path available if a display/driver
+            # cannot create the parked layer during startup.
+            logger.warning(f"[Playlist] Could not warm GPU preloader: {e}")
 
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
@@ -451,6 +466,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.__preload_widget = preload_widget
         self._raise_widget(self.__vlc_widget)
         return preload_widget
+
+    def _warm_preload_widget(self):
+        """Realize the parked X11 child before the first media handoff."""
+        if self._is_disposed:
+            self._preload_warmup_source_id = None
+            return False
+        if self.get_window() is None:
+            return True
+        preload_widget = self._ensure_preload_widget()
+        try:
+            if preload_widget.get_window() is None:
+                preload_widget.realize()
+            self._raise_widget(self.__vlc_widget)
+        except Exception as e:
+            logger.debug(f"[Playlist] GPU preloader realize retry: {e}")
+            return True
+        self._preload_warmup_source_id = None
+        return False
 
     def _cancel_preload(self, stop=True):
         if self._preload_timer_id is not None:
@@ -1119,6 +1152,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def cleanup(self):
         """Cleanup resources to prevent memory leaks"""
         self._is_disposed = True
+        if self._preload_warmup_source_id is not None:
+            try:
+                GLib.source_remove(self._preload_warmup_source_id)
+            except Exception:
+                pass
+            self._preload_warmup_source_id = None
         self.fade.cancel()
         self.clear_queued_media()
         self._active_media = None
@@ -1884,6 +1923,17 @@ class VideoPlayer(BasePlayer):
                 monitor_name, self.config.get(CONFIG_KEY_DATA_SOURCE, {})
             )
         if not self._needs_transition_for_monitor(monitor_name, current_base):
+            # Some VLC/output combinations briefly report Ended at the exact
+            # end of an input-repeat loop. Recover on the existing player so
+            # a single looping wallpaper never remains on its last frame.
+            window.keep_current_media_playing()
+            self._trace_transition(
+                "loop_recovery",
+                monitor_name,
+                throttle_key=f"{monitor_name}:loop_recovery",
+                throttle_sec=1.0,
+                base=current_base,
+            )
             return False
         if not self._should_playback_start():
             self._trace_transition(
