@@ -593,6 +593,26 @@ class WallBlazerServer(object):
         # Persist before launching player so it always reads the latest mode/source.
         self._save_config()
 
+        # Keep the existing GPU-backed player process alive for local video
+        # changes.  The player now prepares the replacement in its second
+        # render layer and raises it atomically; tearing down the process here
+        # would discard that prepared frame and recreate the visible stall.
+        if mode == MODE_VIDEO:
+            player = get_instance(DBUS_NAME_PLAYER)
+            if player is not None:
+                try:
+                    if player.mode == MODE_VIDEO:
+                        player.apply_video_config()
+                        logger.info(
+                            "[Mode] Applied video source in-place; kept GPU player alive"
+                        )
+                        self._restart_playlist_timer()
+                        return
+                except Exception as e:
+                    logger.warning(
+                        f"[Mode] In-place video handoff failed; restarting player: {e}"
+                    )
+
         # Ask current player to quit, but don't let this block server responsiveness.
         self._quit_player(timeout_sec=0.8)
 

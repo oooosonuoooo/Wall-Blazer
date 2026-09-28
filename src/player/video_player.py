@@ -42,8 +42,10 @@ except (ModuleNotFoundError, ImportError):
 
 logger = logging.getLogger(LOGGER_NAME)
 
-INSTANT_PLAYLIST_SWITCH_LEAD_MS = 500
-INSTANT_PLAYLIST_POLL_INTERVAL_MS = 100
+INSTANT_PLAYLIST_SWITCH_LEAD_MS = 1600
+INSTANT_PLAYLIST_POLL_INTERVAL_MS = 80
+PRELOAD_POLL_INTERVAL_MS = 40
+PRELOAD_TIMEOUT_SEC = 12.0
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _LOW_END_MODE_ENV = "WALLBLAZER_LOW_END_MODE"
@@ -379,9 +381,23 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
         self._active_media = None
+        self._active_source = None
         self._media_generation = 0
         self._end_reached_event_manager = None
         self._end_reached_event_callback = None
+        self.__preload_widget = None
+        self._preload_timer_id = None
+        self._preload_generation = 0
+        self._preload_source = None
+        self._preload_media = None
+        self._preload_started = False
+        self._preload_ready = False
+        self._preload_failed = False
+        self._preload_disable_audio = False
+        self._preload_started_at = 0.0
+        self._preload_switch_requested = False
+        self._preload_switch_should_play = True
+        self._preload_switch_callback = None
         self._fit_mode = "cover"
         self._playback_rate = 1.0
         self._rate_apply_source_id = None
@@ -408,8 +424,177 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return None
         return getattr(self.__vlc_widget, "player", None)
 
+    @staticmethod
+    def _raise_widget(widget):
+        """Keep the selected X11 VLC child above the parked preloader."""
+        if widget is None:
+            return
+        try:
+            gdk_window = widget.get_window()
+            if gdk_window is not None:
+                gdk_window.raise_()
+        except Exception as e:
+            logger.debug(f"[Playlist] Could not raise video layer: {e}")
+
+    def _ensure_preload_widget(self):
+        """Create the second GPU-backed player only when a transition needs it."""
+        if self.__preload_widget is not None:
+            return self.__preload_widget
+
+        preload_widget = VLCWidget(self.width, self.height)
+        preload_widget.set_no_show_all(True)
+        preload_widget.player.video_set_mouse_input(False)
+        preload_widget.player.video_set_key_input(False)
+        self._viewport.put(preload_widget, 0, 0)
+        preload_widget.show()
+        preload_widget.hide()
+        self.__preload_widget = preload_widget
+        self._raise_widget(self.__vlc_widget)
+        return preload_widget
+
+    def _cancel_preload(self, stop=True):
+        if self._preload_timer_id is not None:
+            try:
+                GLib.source_remove(self._preload_timer_id)
+            except Exception:
+                pass
+            self._preload_timer_id = None
+        self._preload_generation += 1
+        if stop and self.__preload_widget is not None:
+            try:
+                self.__preload_widget.player.stop()
+            except Exception:
+                pass
+        self._preload_source = None
+        self._preload_media = None
+        self._preload_started = False
+        self._preload_ready = False
+        self._preload_failed = False
+        self._preload_disable_audio = False
+        self._preload_started_at = 0.0
+        self._preload_switch_requested = False
+        self._preload_switch_callback = None
+
+    def _preload_tick(self, generation):
+        if self._is_disposed or generation != self._preload_generation:
+            return False
+        if self.__preload_widget is None or not self._preload_source:
+            self._preload_timer_id = None
+            return False
+
+        elapsed = time.monotonic() - self._preload_started_at
+        if elapsed > PRELOAD_TIMEOUT_SEC:
+            self._preload_failed = True
+            self._preload_timer_id = None
+            logger.warning(
+                f"[Playlist] Preload timed out for {self._preload_source}; "
+                "the compatibility switch path will be used"
+            )
+            if self._preload_switch_requested:
+                GLib.idle_add(self._perform_requested_switch)
+            return False
+
+        player = self.__preload_widget.player
+        try:
+            if self.__preload_widget.get_window() is None:
+                return True
+
+            if not self._preload_started:
+                player.stop()
+                preload_media = self.__preload_widget.instance.media_new(
+                    self._preload_source
+                )
+                preload_media.add_option("no-video-title-show")
+                # Keep the media's audio contract when it is promoted.  The
+                # parked player is muted below, so it cannot leak next-clip
+                # audio while it prepares.
+                if self._preload_disable_audio:
+                    preload_media.add_option("no-audio")
+                player.set_media(preload_media)
+                player.audio_set_mute(True)
+                play_result = player.play()
+                self._preload_media = preload_media
+                self._preload_started = True
+                logger.debug(
+                    f"[Playlist] GPU preloader started source={self._preload_source} "
+                    f"rc={play_result}"
+                )
+                return True
+
+            state = player.get_state()
+            if state == vlc.State.Error:
+                self._preload_failed = True
+                self._preload_timer_id = None
+                logger.warning(
+                    f"[Playlist] GPU preloader failed for {self._preload_source}"
+                )
+                if self._preload_switch_requested:
+                    GLib.idle_add(self._perform_requested_switch)
+                return False
+
+            try:
+                video_width, video_height = player.video_get_size()
+            except Exception:
+                video_width, video_height = (0, 0)
+            try:
+                duration = player.get_length()
+            except Exception:
+                duration = 0
+
+            if state in (vlc.State.Playing, vlc.State.Paused) and (
+                (video_width and video_height) or duration > 0
+            ):
+                # Pause after the decoder has produced a valid first frame.
+                # The next transition can now raise this already-decoded layer.
+                player.set_pause(1)
+                player.audio_set_mute(True)
+                self._preload_ready = True
+                self._preload_timer_id = None
+                self._apply_crop_for_widget(
+                    self.__preload_widget,
+                    *self._queued_dimensions,
+                )
+                logger.info(
+                    f"[Playlist] GPU preloader ready source={self._preload_source}"
+                )
+                if self._preload_switch_requested:
+                    GLib.idle_add(self._perform_requested_switch)
+                return False
+        except Exception as e:
+            logger.debug(f"[Playlist] Preload probe failed: {e}")
+
+        return True
+
+    def _start_preload(self, source, disable_audio=False):
+        preload_widget = self._ensure_preload_widget()
+        preload_widget.show()
+        self._raise_widget(self.__vlc_widget)
+        self._cancel_preload()
+        self._preload_source = source
+        self._preload_disable_audio = bool(disable_audio)
+        self._preload_started_at = time.monotonic()
+        generation = self._preload_generation
+        self._preload_timer_id = GLib.timeout_add(
+            PRELOAD_POLL_INTERVAL_MS,
+            self._preload_tick,
+            generation,
+        )
+
+    def _detach_end_reached_handler(self):
+        if self._end_reached_event_manager is None:
+            return
+        try:
+            self._end_reached_event_manager.event_detach(
+                vlc.EventType.MediaPlayerEndReached
+            )
+        except Exception:
+            pass
+        self._end_reached_event_manager = None
+        self._end_reached_event_callback = None
+
     def _attach_end_reached_handler(self):
         """Forward VLC's end event onto GTK's main loop for instant playlists."""
+        self._detach_end_reached_handler()
         player = self._vlc_player()
         if player is None:
             return
@@ -447,6 +632,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.width = max(1, int(width))
         self.height = max(1, int(height))
         self._viewport.set_viewport_size(self.width, self.height)
+        if self.__preload_widget is not None:
+            self.__preload_widget.set_size_request(self.width, self.height)
         self.resize(self.width, self.height)
         self.move(int(x), int(y))
         self.schedule_centercrop()
@@ -458,6 +645,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self.width = width
             self.height = height
             self._viewport.set_viewport_size(width, height)
+            if self.__preload_widget is not None:
+                self.__preload_widget.set_size_request(width, height)
             self.schedule_centercrop()
         return False
 
@@ -582,6 +771,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def is_playing(self):
         return self.__vlc_widget.player.is_playing()
 
+    def keep_current_media_playing(self):
+        """Avoid a black frame if a decoder misses the transition deadline."""
+        try:
+            state = self.__vlc_widget.player.get_state()
+            if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+                self.__vlc_widget.player.set_position(0.0)
+                self.__vlc_widget.player.play()
+        except Exception as e:
+            logger.debug(f"[Playlist] Could not keep current media alive: {e}")
+
     def pause(self):
         if self.is_playing():
             self.__vlc_widget.player.pause()
@@ -603,20 +802,43 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def media_new(self, *args):
         return self.__vlc_widget.instance.media_new(*args)
 
-    def set_media(self, *args):
+    def set_media(self, *args, source=None):
         if args:
             self._active_media = args[0]
+            self._active_source = source
             self._media_generation += 1
+        self._cancel_preload()
         self._clear_vlc_string_option(self.__vlc_widget.player.video_set_aspect_ratio)
         self._clear_vlc_string_option(self.__vlc_widget.player.video_set_crop_geometry)
         self.__vlc_widget.player.set_media(*args)
+        self._raise_widget(self.__vlc_widget)
 
-    def queue_media(self, media, source, base_source=None, phase="forward", video_width=None, video_height=None):
+    def active_source(self):
+        return self._active_source
+
+    def _clear_queue_metadata(self):
+        self._queued_media = None
+        self._queued_source = None
+        self._queued_base = None
+        self._queued_phase = "forward"
+        self._queued_dimensions = (None, None)
+
+    def queue_media(
+        self,
+        media,
+        source,
+        base_source=None,
+        phase="forward",
+        video_width=None,
+        video_height=None,
+        disable_audio=False,
+    ):
         self._queued_media = media
         self._queued_source = source
         self._queued_base = base_source if base_source else source
         self._queued_phase = phase
         self._queued_dimensions = (video_width, video_height)
+        self._start_preload(source, disable_audio=disable_audio)
 
     def queued_source(self):
         return self._queued_source
@@ -627,35 +849,198 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def queued_phase(self):
         return self._queued_phase
 
-    def clear_queued_media(self):
-        self._queued_media = None
-        self._queued_source = None
-        self._queued_base = None
-        self._queued_phase = "forward"
-        self._queued_dimensions = (None, None)
+    def queued_ready(self):
+        return bool(
+            self._queued_source
+            and self._preload_source == self._queued_source
+            and self._preload_ready
+        )
 
-    def switch_to_queued_media(self, should_play=True):
+    def queued_preload_failed(self):
+        return bool(
+            self._queued_source
+            and self._preload_source == self._queued_source
+            and self._preload_failed
+        )
+
+    def has_direct_switch_pending(self):
+        return bool(self._preload_switch_requested and self._queued_source)
+
+    def clear_queued_media(self):
+        self._clear_queue_metadata()
+        self._cancel_preload()
+
+    def request_queued_switch(self, should_play=True, callback=None):
         if not self._queued_media:
+            return False
+        self._preload_switch_requested = True
+        self._preload_switch_should_play = bool(should_play)
+        self._preload_switch_callback = callback
+        if self.queued_ready() or self.queued_preload_failed():
+            GLib.idle_add(self._perform_requested_switch)
+        return True
+
+    def _perform_requested_switch(self):
+        if self._is_disposed or not self._preload_switch_requested:
+            return False
+        if not self.queued_ready() and not self.queued_preload_failed():
+            return False
+        callback = self._preload_switch_callback
+        result = self.switch_to_queued_media(
+            should_play=self._preload_switch_should_play,
+            allow_unprepared=self.queued_preload_failed(),
+        )
+        if result[0] and callback is not None:
+            try:
+                callback(*result)
+            except Exception as e:
+                logger.warning(f"[Playlist] Smooth source callback failed: {e}")
+        return False
+
+    def _apply_crop_for_widget(self, widget, video_width=None, video_height=None):
+        if widget is None:
+            return False
+        player = getattr(widget, "player", None)
+        if player is None:
+            return False
+        if video_width is None or video_height is None:
+            try:
+                video_width, video_height = player.video_get_size()
+            except Exception:
+                return False
+        if not video_width or not video_height:
+            return False
+
+        try:
+            player.video_set_scale(0)
+            fit_mode = self._fit_mode
+            if fit_mode == "stretch":
+                widget.set_size_request(self.width, self.height)
+                self._viewport.move(widget, 0, 0)
+                self._clear_vlc_string_option(player.video_set_crop_geometry)
+                player.video_set_aspect_ratio(f"{self.width}:{self.height}")
+                return True
+
+            self._clear_vlc_string_option(player.video_set_aspect_ratio)
+            self._clear_vlc_string_option(player.video_set_crop_geometry)
+            geometry = calculate_fit_geometry(
+                self.width,
+                self.height,
+                video_width,
+                video_height,
+                fit_mode,
+            )
+            widget.set_size_request(geometry.width, geometry.height)
+            self._viewport.move(widget, geometry.x, geometry.y)
+            return True
+        except Exception as e:
+            logger.debug(f"[CenterCrop] Could not apply geometry: {e}")
+            return False
+
+    def _activate_preloaded_media(self, media, source, video_width, video_height, should_play):
+        new_widget = self.__preload_widget
+        old_widget = self.__vlc_widget
+        if new_widget is None:
+            return False
+
+        old_player = old_widget.player
+        new_player = new_widget.player
+        try:
+            volume = old_player.audio_get_volume()
+        except Exception:
+            volume = 0
+        try:
+            mute = old_player.audio_get_mute()
+        except Exception:
+            mute = 1
+
+        try:
+            new_player.audio_set_volume(volume)
+            new_player.audio_set_mute(mute)
+            self._clear_vlc_string_option(new_player.video_set_aspect_ratio)
+            self._clear_vlc_string_option(new_player.video_set_crop_geometry)
+            self._apply_crop_for_widget(new_widget, video_width, video_height)
+        except Exception as e:
+            logger.debug(f"[Playlist] Could not prepare preloaded layer: {e}")
+
+        self._detach_end_reached_handler()
+        self.__vlc_widget = new_widget
+        self.__preload_widget = old_widget
+        self._active_media = media
+        self._active_source = source
+        self._media_generation += 1
+
+        self._preload_timer_id = None
+        self._preload_source = None
+        self._preload_media = None
+        self._preload_started = False
+        self._preload_ready = False
+        self._preload_failed = False
+        self._preload_disable_audio = False
+        self._preload_started_at = 0.0
+        self._preload_switch_requested = False
+        self._preload_switch_callback = None
+
+        self._raise_widget(self.__vlc_widget)
+        try:
+            if should_play:
+                new_player.set_pause(0)
+            else:
+                new_player.set_pause(1)
+        except Exception:
+            try:
+                if should_play:
+                    new_player.play()
+            except Exception:
+                pass
+
+        # Stop only after the prepared layer is visible, so the old frame never
+        # disappears into a black gap during the handoff.
+        try:
+            old_player.stop()
+        except Exception:
+            pass
+        self._attach_end_reached_handler()
+        self._schedule_rate_apply(delay_ms=0)
+        self._schedule_adjustment_reapply(delay_ms=0)
+        return True
+
+    def switch_to_queued_media(self, should_play=True, allow_unprepared=False):
+        if not self._queued_media:
+            return None, None, None
+        if not self.queued_ready() and not allow_unprepared:
             return None, None, None
         media = self._queued_media
         source = self._queued_source
         base_source = self._queued_base if self._queued_base else source
         phase = self._queued_phase
         video_width, video_height = self._queued_dimensions
-        self.clear_queued_media()
-        try:
-            # Force VLC to detach the current media before swapping.
-            # Without this, libVLC can keep the old clip active and ignore
-            # the queued reverse/next media during seamless transitions.
-            self.__vlc_widget.player.stop()
-        except Exception as e:
-            logger.debug(f"[Playlist] stop() before switch failed: {e}")
-        self.set_media(media)
-        self.schedule_centercrop(video_width, video_height)
-        if should_play:
-            self.play()
+
+        use_preloaded_layer = self.queued_ready()
+        self._clear_queue_metadata()
+        if use_preloaded_layer:
+            self._activate_preloaded_media(
+                media,
+                source,
+                video_width,
+                video_height,
+                should_play,
+            )
+        else:
+            self._cancel_preload()
+            try:
+                # Last-resort compatibility path for a decoder/driver failure.
+                # Normal transitions never enter this branch.
+                self.__vlc_widget.player.stop()
+            except Exception as e:
+                logger.debug(f"[Playlist] stop() before fallback switch failed: {e}")
+            self.set_media(media, source=source)
+            self.schedule_centercrop(video_width, video_height)
+            if should_play:
+                self.play()
         logger.info(
-            f"[Playlist] Switched media source={source} base={base_source} phase={phase}"
+            f"[Playlist] Switched media source={source} base={base_source} phase={phase} "
+            f"prepared={use_preloaded_layer}"
         )
         return source, base_source, phase
 
@@ -695,36 +1080,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 logger.warning("[CenterCrop] video_get_size is not ready yet")
                 return False
         logger.debug(f"[CenterCrop] Dimension {video_width}x{video_height}")
-
-        # Keep VLC in autoscale mode inside a precisely-sized child widget.  A
-        # Gtk.Fixed viewport then clips the oversize child for cover mode,
-        # which is reliable across VLC output modules and keeps the crop
-        # centered without any letterboxing.
-        player.video_set_scale(0)
-        fit_mode = self._fit_mode
-        if fit_mode == "stretch":
-            self.__vlc_widget.set_size_request(self.width, self.height)
-            self._viewport.move(self.__vlc_widget, 0, 0)
-            self._clear_vlc_string_option(player.video_set_crop_geometry)
-            player.video_set_aspect_ratio(f"{self.width}:{self.height}")
-            return True
-
-        self._clear_vlc_string_option(player.video_set_aspect_ratio)
-        self._clear_vlc_string_option(player.video_set_crop_geometry)
-        geometry = calculate_fit_geometry(
-            self.width,
-            self.height,
+        return self._apply_crop_for_widget(
+            self.__vlc_widget,
             video_width,
             video_height,
-            fit_mode,
         )
-        logger.debug(
-            f"[CenterCrop] {fit_mode} geometry: "
-            f"{geometry.width}x{geometry.height}+{geometry.x}+{geometry.y}"
-        )
-        self.__vlc_widget.set_size_request(geometry.width, geometry.height)
-        self._viewport.move(self.__vlc_widget, geometry.x, geometry.y)
-        return True
 
     def schedule_centercrop(self, video_width=None, video_height=None, attempts=18, delay_ms=120):
         def _try_crop(remaining):
@@ -762,13 +1122,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.fade.cancel()
         self.clear_queued_media()
         self._active_media = None
-        if self._end_reached_event_manager is not None:
-            try:
-                self._end_reached_event_manager.event_detach(vlc.EventType.MediaPlayerEndReached)
-            except Exception:
-                pass
-            self._end_reached_event_manager = None
-            self._end_reached_event_callback = None
+        self._detach_end_reached_handler()
         if self._rate_apply_source_id is not None:
             try:
                 GLib.source_remove(self._rate_apply_source_id)
@@ -783,6 +1137,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._adjust_apply_source_id = None
         if self.__vlc_widget:
             self.__vlc_widget.cleanup()
+        if self.__preload_widget:
+            self.__preload_widget.cleanup()
+            self.__preload_widget = None
 
     def media_event_manager(self):
         player = self._vlc_player()
@@ -1332,7 +1689,15 @@ class VideoPlayer(BasePlayer):
             loop_video=False,
             disable_audio=not monitor.is_primary(),
         )
-        window.queue_media(media, next_source, next_base, next_phase, video_width, video_height)
+        window.queue_media(
+            media,
+            next_source,
+            next_base,
+            next_phase,
+            video_width,
+            video_height,
+            disable_audio=not monitor.is_primary(),
+        )
         self._trace_transition(
             "queued",
             monitor_name,
@@ -1340,7 +1705,7 @@ class VideoPlayer(BasePlayer):
             base=next_base,
             phase=next_phase,
         )
-        logger.debug(f"[Playlist] Preloaded next video for {monitor_name}: {next_source}")
+        logger.debug(f"[Playlist] Preparing next video on GPU for {monitor_name}: {next_source}")
         if next_base and self._reverse_enabled_for_monitor(monitor_name, next_base):
             self._prime_reverse_cache_for_monitor(monitor_name, current_base=next_base)
 
@@ -1388,6 +1753,15 @@ class VideoPlayer(BasePlayer):
         monitor_name = monitor.get_model()
         if monitor_name in self._playlist_switching_monitors:
             return
+        if window.has_direct_switch_pending():
+            self._trace_transition(
+                "direct_switch_pending",
+                monitor_name,
+                throttle_key=f"{monitor_name}:direct_switch_pending",
+                throttle_sec=0.5,
+                queued=window.queued_source(),
+            )
+            return
         state = self._reverse_state.get(monitor_name)
         current_base = None
         current_phase = "forward"
@@ -1417,8 +1791,33 @@ class VideoPlayer(BasePlayer):
         if not queued_source:
             self._prepare_next_media(monitor, window, current_base, current_phase)
             queued_source = window.queued_source()
+            queued_base = window.queued_base()
+            queued_phase = window.queued_phase()
             if not queued_source:
                 return
+
+        # A queued Media object is only metadata.  Do not tear down the live
+        # player until the second GPU-backed player has decoded its first frame.
+        # If preparation is still in flight, keep the current layer visible;
+        # this is what prevents the black/stuck gap at the old transition point.
+        if not window.queued_ready():
+            if not window.queued_preload_failed():
+                window.keep_current_media_playing()
+                self._trace_transition(
+                    "waiting_for_preload",
+                    monitor_name,
+                    throttle_key=f"{monitor_name}:waiting_for_preload",
+                    throttle_sec=0.5,
+                    source=queued_source,
+                )
+                return
+            self._trace_transition(
+                "preload_fallback",
+                monitor_name,
+                throttle_key=f"{monitor_name}:preload_fallback",
+                throttle_sec=1.0,
+                source=queued_source,
+            )
 
         if queued_phase == "forward" and queued_base:
             self._prime_reverse_cache_for_monitor(monitor_name, current_base=queued_base, max_items=1)
@@ -1476,6 +1875,8 @@ class VideoPlayer(BasePlayer):
         monitor, window = self._find_monitor_window(monitor_name)
         if monitor is None or window is None:
             return False
+        if window.has_direct_switch_pending():
+            return True
         state = self._reverse_state.get(monitor_name, {})
         current_base = state.get("base")
         if not current_base:
@@ -1522,6 +1923,15 @@ class VideoPlayer(BasePlayer):
         monitor, window = self._find_monitor_window(monitor_name)
         if monitor is None or window is None:
             return False
+        if window.has_direct_switch_pending():
+            self._trace_transition(
+                "direct_switch_pending",
+                monitor_name,
+                throttle_key=f"{monitor_name}:tick_direct_switch_pending",
+                throttle_sec=0.5,
+                queued=window.queued_source(),
+            )
+            return True
         state = self._reverse_state.get(monitor_name, {})
         current_base = state.get("base")
         if not current_base:
@@ -1616,7 +2026,16 @@ class VideoPlayer(BasePlayer):
         return True
 
     def _start_instant_playlist_transitions(self):
-        self._stop_playlist_timers()
+        for timer_id in self._playlist_monitor_timers.values():
+            try:
+                GLib.source_remove(timer_id)
+            except Exception:
+                pass
+        self._playlist_monitor_timers.clear()
+        self._playlist_switching_monitors.clear()
+        for window in self.windows.values():
+            if window and not window.has_direct_switch_pending():
+                window.clear_queued_media()
         if self.mode != MODE_VIDEO:
             return
         for monitor, window in self.windows.items():
@@ -1635,7 +2054,17 @@ class VideoPlayer(BasePlayer):
                 }
                 state = self._reverse_state[monitor_name]
             if self._needs_transition_for_monitor(monitor_name, base_source):
-                self._prepare_next_media(monitor, window, base_source, state.get("phase", "forward"))
+                # A direct GUI source change is already being prepared by the
+                # window.  Let that atomic handoff finish before queuing the
+                # playlist successor, otherwise the successor would replace
+                # the requested video in the preload slot.
+                if not window.has_direct_switch_pending():
+                    self._prepare_next_media(
+                        monitor,
+                        window,
+                        base_source,
+                        state.get("phase", "forward"),
+                    )
                 timer_id = GLib.timeout_add(
                     INSTANT_PLAYLIST_POLL_INTERVAL_MS,
                     self._playlist_tick,
@@ -1649,7 +2078,41 @@ class VideoPlayer(BasePlayer):
                     phase=state.get("phase", "forward"),
                 )
         if self._playlist_monitor_timers:
-            logger.info("[Playlist] Seamless transitions enabled (0.5s preload lead)")
+            logger.info(
+                "[Playlist] Seamless transitions enabled "
+                f"({INSTANT_PLAYLIST_SWITCH_LEAD_MS}ms GPU-preload lead)"
+            )
+
+    def _on_direct_media_switched(
+        self,
+        monitor_name,
+        switched_source,
+        switched_base,
+        switched_phase,
+    ):
+        """Finish a GUI-requested source change after the prepared handoff."""
+        monitor, window = self._find_monitor_window(monitor_name)
+        if monitor is None or window is None or not switched_base:
+            return
+        self._reverse_state[monitor_name] = {
+            "base": switched_base,
+            "phase": switched_phase or "forward",
+        }
+        self._apply_window_profile(monitor, window, switched_phase or "forward")
+        self._trace_transition(
+            "direct_switched",
+            monitor_name,
+            source=switched_source,
+            base=switched_base,
+            phase=switched_phase or "forward",
+        )
+        if self._needs_transition_for_monitor(monitor_name, switched_base):
+            self._prepare_next_media(
+                monitor,
+                window,
+                switched_base,
+                switched_phase or "forward",
+            )
 
     @property
     def mode(self):
@@ -1673,27 +2136,69 @@ class VideoPlayer(BasePlayer):
                     window.clear_queued_media()
                     self._reverse_state.pop(monitor_name, None)
                     continue
-                self._reverse_state[monitor_name] = {
-                    "base": base_source,
-                    "phase": "forward",
-                }
                 reverse_active = self._reverse_enabled_for_monitor(monitor_name, base_source)
                 # loop_video=True ONLY when no automatic advance is needed
                 # (i.e. no playlist-end-advance AND no reverse mode)
                 needs_transition = self._needs_transition_for_monitor(monitor_name, base_source)
                 loop_video = not needs_transition
-                logger.info(f"Setting source {base_source} to {monitor.get_model()} (loop={loop_video}, reverse={reverse_active})")
+                current_source = window.active_source()
+                same_source = bool(
+                    current_source
+                    and os.path.realpath(str(current_source))
+                    == os.path.realpath(str(base_source))
+                )
+                logger.info(
+                    f"Setting source {base_source} to {monitor.get_model()} "
+                    f"(loop={loop_video}, reverse={reverse_active}, "
+                    f"smooth={'yes' if current_source and not same_source else 'no'})"
+                )
                 media = self._create_video_media(
                     window=window,
                     source=base_source,
                     loop_video=loop_video,
                     disable_audio=not monitor.is_primary(),
                 )
-                window.set_media(media)
-                self._apply_window_profile(monitor, window, "forward")
-                window.set_position(0.0)
                 video_width, video_height = self._probe_video_dimensions(base_source, monitor_name)
-                window.schedule_centercrop(video_width, video_height)
+
+                if current_source and not same_source:
+                    # Keep the current frame on screen while the second
+                    # GPU-backed VLC player opens and decodes the new source.
+                    self._apply_window_profile(monitor, window, "forward")
+                    window.queue_media(
+                        media,
+                        base_source,
+                        base_source,
+                        "forward",
+                        video_width,
+                        video_height,
+                        disable_audio=not monitor.is_primary(),
+                    )
+                    window.request_queued_switch(
+                        should_play=self._should_playback_start(),
+                        callback=lambda source, switched_base, phase,
+                        monitor_name=monitor_name: self._on_direct_media_switched(
+                            monitor_name,
+                            source,
+                            switched_base,
+                            phase,
+                        ),
+                    )
+                    self._trace_transition(
+                        "direct_queued",
+                        monitor_name,
+                        source=base_source,
+                        base=base_source,
+                        phase="forward",
+                    )
+                else:
+                    self._reverse_state[monitor_name] = {
+                        "base": base_source,
+                        "phase": "forward",
+                    }
+                    window.set_media(media, source=base_source)
+                    self._apply_window_profile(monitor, window, "forward")
+                    window.set_position(0.0)
+                    window.schedule_centercrop(video_width, video_height)
                 if reverse_active:
                     max_reverse_items = 2 if self._playlist_interval_seconds() == 0 else 1
                     self._prime_reverse_cache_for_monitor(
