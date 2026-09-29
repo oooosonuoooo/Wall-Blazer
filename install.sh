@@ -80,6 +80,8 @@ install_system_dependencies() {
       sudo apt-get install -y \
         python3 python3-pip python3-gi python3-gi-cairo \
         gir1.2-gtk-3.0 gir1.2-wnck-3.0 gir1.2-ayatanaappindicator3-0.1 \
+        python3-gst-1.0 gstreamer1.0-tools gstreamer1.0-gl gstreamer1.0-gtk3 \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
         meson ninja-build pkg-config vlc ffmpeg gettext vdpauinfo \
         python3-pydbus python3-pil python3-vlc python3-setproctitle \
         python3-requests yt-dlp mesa-utils

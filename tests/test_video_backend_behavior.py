@@ -147,7 +147,7 @@ class PreloadTransitionTests(unittest.TestCase):
 
 
 class BackendSelectionTests(unittest.TestCase):
-    def test_auto_uses_vlc_on_x11_when_both_backends_exist(self):
+    def test_auto_uses_gpu_gstreamer_on_x11_when_gpu_path_exists(self):
         with (
             patch.dict(
                 os.environ,
@@ -156,6 +156,20 @@ class BackendSelectionTests(unittest.TestCase):
             ),
             patch.object(server, "gst_video_player_available", True),
             patch.object(server, "_vlc_video_player_available", return_value=True),
+            patch.object(server, "_gstreamer_gpu_path_available", return_value=True),
+        ):
+            self.assertTrue(server._prefer_gstreamer_video_backend())
+
+    def test_auto_falls_back_to_vlc_on_x11_without_gpu_path(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"WALLBLAZER_VIDEO_BACKEND": "auto", "XDG_SESSION_TYPE": "x11"},
+                clear=False,
+            ),
+            patch.object(server, "gst_video_player_available", True),
+            patch.object(server, "_vlc_video_player_available", return_value=True),
+            patch.object(server, "_gstreamer_gpu_path_available", return_value=False),
         ):
             self.assertFalse(server._prefer_gstreamer_video_backend())
 

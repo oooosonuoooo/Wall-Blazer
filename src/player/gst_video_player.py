@@ -342,7 +342,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_base = None
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
+        self._direct_switch_pending = False
         self._active_media = None
+        self._active_source = None
         self._fit_mode = "cover"
         self._playback_rate = 1.0
         self._rate_applied = False
@@ -679,17 +681,21 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def media_new(self, source):
         return GstMedia(source)
 
-    def set_media(self, media):
+    def set_media(self, media, source=None):
         if media is None:
             return
         self._switch_render_path(
             _gpu_decoder_for_source(media.source, self._video_adjustments)
         )
         self._active_media = media
+        self._active_source = source if source is not None else media.source
         self._rate_applied = False
         self._player.set_state(Gst.State.NULL)
         self._player.set_property("uri", self._source_to_uri(media.source))
         self._apply_current_audio_flags()
+
+    def active_source(self):
+        return self._active_source
 
     def queue_media(self, media, source, base_source=None, phase="forward", video_width=None, video_height=None):
         self._queued_media = media
@@ -697,6 +703,37 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_base = base_source if base_source else source
         self._queued_phase = phase
         self._queued_dimensions = (video_width, video_height)
+
+    def queued_ready(self):
+        # GStreamer keeps one live playbin.  A queued item is ready for the
+        # compatibility handoff as soon as its metadata is available; the
+        # current frame remains visible until the idle callback promotes it.
+        return self._queued_media is not None
+
+    def queued_preload_failed(self):
+        return False
+
+    def has_direct_switch_pending(self):
+        return bool(self._direct_switch_pending)
+
+    def request_queued_switch(self, should_play=True, callback=None):
+        if self._queued_media is None:
+            return False
+        self._direct_switch_pending = True
+
+        def _switch():
+            if not self._direct_switch_pending:
+                return False
+            result = self.switch_to_queued_media(should_play=should_play)
+            if result[0] and callback is not None:
+                try:
+                    callback(*result)
+                except Exception as e:
+                    logger.warning(f"[Gst] Direct source callback failed: {e}")
+            return False
+
+        GLib.idle_add(_switch)
+        return True
 
     def queued_source(self):
         return self._queued_source
@@ -708,13 +745,14 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         return self._queued_phase
 
     def clear_queued_media(self):
+        self._direct_switch_pending = False
         self._queued_media = None
         self._queued_source = None
         self._queued_base = None
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
 
-    def switch_to_queued_media(self, should_play=True):
+    def switch_to_queued_media(self, should_play=True, allow_unprepared=False):
         if not self._queued_media:
             return None, None, None
         media = self._queued_media
@@ -723,7 +761,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         phase = self._queued_phase
         video_width, video_height = self._queued_dimensions
         self.clear_queued_media()
-        self.set_media(media)
+        self.set_media(media, source=source)
         self.schedule_centercrop(video_width, video_height)
         if should_play:
             self.play()
@@ -731,6 +769,15 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             f"[Playlist] Switched media source={source} base={base_source} phase={phase}"
         )
         return source, base_source, phase
+
+    def keep_current_media_playing(self):
+        if self._active_media is None:
+            return
+        try:
+            if self._query_state() in {Gst.State.NULL, Gst.State.READY, Gst.State.PAUSED}:
+                self._player.set_state(Gst.State.PLAYING)
+        except Exception as e:
+            logger.debug(f"[Gst] Could not keep current media playing: {e}")
 
     def set_volume(self, volume):
         try:
@@ -869,7 +916,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def cleanup(self):
         self.fade.cancel()
         self.clear_queued_media()
+        self._direct_switch_pending = False
         self._active_media = None
+        self._active_source = None
         if self._rate_apply_source_id is not None:
             try:
                 GLib.source_remove(self._rate_apply_source_id)

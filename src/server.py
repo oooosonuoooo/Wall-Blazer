@@ -148,6 +148,31 @@ def _vlc_video_player_available():
         return False
 
 
+def _gstreamer_gpu_path_available():
+    """Check the actual NVDEC/GL factories before selecting GStreamer."""
+    if not gst_video_player_available:
+        return False
+    try:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        Gst.init(None)
+        required = ("gtkglsink", "glupload", "glcolorconvert", "glcolorbalance")
+        if any(Gst.ElementFactory.find(name) is None for name in required):
+            return False
+        decoders = ("nvh264dec", "nvh265dec", "nvvp9dec")
+        return any(
+            (factory := Gst.ElementFactory.find(name)) is not None
+            and factory.get_rank() > Gst.Rank.NONE
+            for name in decoders
+        )
+    except Exception as e:
+        logger.debug(f"[Gst] GPU factory probe failed: {e}")
+        return False
+
+
 def _prefer_gstreamer_video_backend():
     gst_available = bool(gst_video_player_available or (globals().get("gst_video_player_main") is not None))
     backend = str(os.environ.get("WALLBLAZER_VIDEO_BACKEND", "auto")).strip().lower()
@@ -157,10 +182,13 @@ def _prefer_gstreamer_video_backend():
         return gst_available
     if not gst_available or sys.platform == "win32":
         return False
-    # VLC's X11 renderer is substantially lighter than gtkglsink on NVIDIA
-    # systems and has reliable wallpaper embedding there.  Keep GStreamer as
-    # the automatic fallback on Wayland and when python-vlc is unavailable;
-    # WALLBLAZER_VIDEO_BACKEND=gst remains an explicit escape hatch.
+    # On NVIDIA X11, prefer the validated NVDEC -> GL path.  VLC can report
+    # Playing even after its VDPAU/CUDA surface negotiation fails, leaving
+    # corrupted macroblocks in the embedded X11 window.  Keep VLC as the
+    # compatibility fallback when the GPU-native GStreamer factories are not
+    # installed; WALLBLAZER_VIDEO_BACKEND=vlc remains an explicit override.
+    if _gstreamer_gpu_path_available():
+        return True
     if _is_x11_session() and _vlc_video_player_available():
         return False
     return True
