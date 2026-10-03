@@ -159,8 +159,11 @@ def _gstreamer_gpu_path_available():
         from gi.repository import Gst
 
         Gst.init(None)
-        required = ("gtkglsink", "glupload", "glcolorconvert", "glcolorbalance")
-        if any(Gst.ElementFactory.find(name) is None for name in required):
+        required_filters = ("videorate", "glcolorconvert", "glcolorbalance")
+        render_sinks = ("glimagesink", "gtkglsink")
+        if any(Gst.ElementFactory.find(name) is None for name in required_filters):
+            return False
+        if not any(Gst.ElementFactory.find(name) is not None for name in render_sinks):
             return False
         decoders = ("nvh264dec", "nvh265dec", "nvvp9dec")
         return any(

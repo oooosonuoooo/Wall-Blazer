@@ -10,6 +10,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from player.fit_geometry import calculate_fit_geometry
+from player import gst_video_player
 from player.video_player import PlayerWindow, VideoPlayer
 import server
 
@@ -147,6 +148,24 @@ class PreloadTransitionTests(unittest.TestCase):
 
 
 class BackendSelectionTests(unittest.TestCase):
+    def test_gpu_filter_keeps_nvdec_frames_in_gl_memory(self):
+        self.assertEqual(
+            set(gst_video_player._GPU_FILTER_ELEMENTS),
+            {"videorate", "glcolorconvert", "glcolorbalance"},
+        )
+
+    def test_gpu_presentation_rate_is_bounded_for_wallpaper_playback(self):
+        with patch.dict(os.environ, {"WALLBLAZER_GPU_MAX_FPS": "120"}, clear=False):
+            self.assertEqual(gst_video_player._gpu_max_fps(), 60)
+        with patch.dict(os.environ, {"WALLBLAZER_GPU_MAX_FPS": "bad"}, clear=False):
+            self.assertEqual(gst_video_player._gpu_max_fps(), 30)
+
+    def test_gpu_render_path_prefers_native_x11_sink(self):
+        self.assertEqual(
+            gst_video_player._GPU_RENDER_SINKS,
+            ("glimagesink", "gtkglsink"),
+        )
+
     def test_auto_uses_gpu_gstreamer_on_x11_when_gpu_path_exists(self):
         with (
             patch.dict(

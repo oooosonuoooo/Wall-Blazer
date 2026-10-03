@@ -6,7 +6,13 @@ import sys
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
-from gi.repository import Gtk, Gdk, GLib, Gst
+gi.require_version("GstVideo", "1.0")
+try:
+    gi.require_version("GdkX11", "3.0")
+    from gi.repository import GdkX11
+except (ImportError, ValueError):
+    GdkX11 = None
+from gi.repository import Gtk, Gdk, GLib, Gst, GstVideo
 
 try:
     import os
@@ -35,7 +41,97 @@ _GPU_DECODER_FACTORIES = {
     "hevc": "nvh265dec",
     "vp9": "nvvp9dec",
 }
-_GPU_FILTER_ELEMENTS = ("gtkglsink", "glupload", "glcolorconvert", "glcolorbalance")
+# NVDEC can export GLMemory directly. Keep the GPU path entirely in GL so it
+# does not bounce every decoded frame through the generic uploader. On X11,
+# glimagesink is embedded in a native child window; this avoids routing every
+# rendered frame through GtkGLArea on the Python/GTK main thread. videorate is
+# drop-only, so it throttles a 60 fps wallpaper without touching pixel memory.
+_GPU_FILTER_ELEMENTS = ("videorate", "glcolorconvert", "glcolorbalance")
+_GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
+
+
+def _gpu_max_fps():
+    """Choose a low-overhead presentation rate for GPU wallpaper playback."""
+    try:
+        requested = int(os.environ.get("WALLBLAZER_GPU_MAX_FPS", "30"))
+    except (TypeError, ValueError):
+        requested = 30
+    return max(15, min(requested, 60))
+
+
+def _can_embed_native_gl_sink():
+    """Return whether a native X11 glimagesink can be embedded safely."""
+    if GdkX11 is None or not os.environ.get("DISPLAY"):
+        return False
+    session_type = str(os.environ.get("XDG_SESSION_TYPE", "")).strip().lower()
+    if session_type == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    return True
+
+
+def _set_native_gl_window(sink, widget):
+    """Attach glimagesink to a realized Gtk child window."""
+    if GdkX11 is None:
+        return False
+    try:
+        window = widget.get_window()
+        if window is None:
+            return False
+        window.ensure_native()
+        xid = GdkX11.X11Window.get_xid(window)
+        GstVideo.VideoOverlay.set_window_handle(sink, xid)
+        allocation = widget.get_allocation()
+        GstVideo.VideoOverlay.set_render_rectangle(
+            sink,
+            0,
+            0,
+            max(1, int(allocation.width)),
+            max(1, int(allocation.height)),
+        )
+        return True
+    except Exception as error:
+        logger.debug(f"[Gst] Could not embed glimagesink in X11 child: {error}")
+        return False
+
+
+def _new_native_gl_widget(sink, width, height):
+    """Create a low-overhead native X11 child for glimagesink."""
+    if not _can_embed_native_gl_sink():
+        return None
+    widget = Gtk.DrawingArea()
+    widget.set_has_window(True)
+    widget.set_hexpand(True)
+    widget.set_vexpand(True)
+    widget.set_size_request(width, height)
+
+    def on_realize(realized_widget):
+        _set_native_gl_window(sink, realized_widget)
+
+    widget.connect("realize", on_realize)
+    return widget
+
+
+def _new_gpu_sink_and_widget(width, height):
+    """Build the GPU sink and its host widget for the current display."""
+    if _can_embed_native_gl_sink():
+        sink = Gst.ElementFactory.make("glimagesink", None)
+        widget = _new_native_gl_widget(sink, width, height) if sink is not None else None
+        if sink is not None and widget is not None:
+            return sink, widget, True
+
+    sink = Gst.ElementFactory.make("gtkglsink", None)
+    if sink is None:
+        return None, None, False
+    try:
+        widget = sink.get_property("widget")
+    except Exception:
+        widget = None
+    if widget is None:
+        return None, None, False
+    widget.set_hexpand(True)
+    widget.set_vexpand(True)
+    widget.set_size_request(width, height)
+    return sink, widget, False
 
 
 def _gpu_adjustments_allow_path(adjustments):
@@ -78,6 +174,8 @@ def _gpu_decoder_for_source(source, adjustments=None):
         return None
     if any(Gst.ElementFactory.find(name) is None for name in _GPU_FILTER_ELEMENTS):
         return None
+    if not any(Gst.ElementFactory.find(name) is not None for name in _GPU_RENDER_SINKS):
+        return None
 
     # All existing video adjustments, including gamma, remain in the video
     # stream.  The GPU path handles gamma with _GPU_GAMMA_FRAGMENT below.
@@ -85,20 +183,22 @@ def _gpu_decoder_for_source(source, adjustments=None):
 
 
 def _build_gpu_filter_bin():
-    """Build an all-GL color path for NVIDIA-decoded video frames."""
-    upload = Gst.ElementFactory.make("glupload", None)
+    """Build a direct NVDEC-GL color path for NVIDIA-decoded video frames."""
+    rate = Gst.ElementFactory.make("videorate", None)
     convert = Gst.ElementFactory.make("glcolorconvert", None)
     balance = Gst.ElementFactory.make("glcolorbalance", None)
-    if any(element is None for element in (upload, convert, balance)):
+    if any(element is None for element in (rate, convert, balance)):
         return None, None, None
+    rate.set_property("max-rate", _gpu_max_fps())
+    rate.set_property("drop-only", True)
 
     filter_bin = Gst.Bin.new("wallblazer-gpu-video-filter")
-    for element in (upload, convert, balance):
+    for element in (rate, convert, balance):
         filter_bin.add(element)
-    if not upload.link(convert) or not convert.link(balance):
+    if not rate.link(convert) or not convert.link(balance):
         return None, None, None
 
-    sink_pad = upload.get_static_pad("sink")
+    sink_pad = rate.get_static_pad("sink")
     src_pad = balance.get_static_pad("src")
     if sink_pad is None or src_pad is None:
         return None, None, None
@@ -264,23 +364,29 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._gpu_filter = None
         self._gpu_gamma_shader = None
         self._gpu_decoder = None
+        self._gpu_native_sink = False
         self._video_balance = None
         self._gamma_element = None
         self._video_filter = None
 
         if gpu_decoder:
-            gpu_sink = Gst.ElementFactory.make("gtkglsink", None)
+            gpu_sink, gpu_widget, gpu_native_sink = _new_gpu_sink_and_widget(
+                self.width, self.height
+            )
             gpu_filter, gpu_balance, gpu_gamma = _build_gpu_filter_bin()
-            if gpu_sink is not None and gpu_filter is not None:
+            if gpu_sink is not None and gpu_widget is not None and gpu_filter is not None:
                 self._sink = gpu_sink
+                self._video_widget = gpu_widget
                 self._gpu_filter = gpu_filter
                 self._video_balance = gpu_balance
                 self._gpu_gamma_shader = gpu_gamma
                 self._gpu_decoder = gpu_decoder
+                self._gpu_native_sink = gpu_native_sink
                 self._using_gpu_filters = True
+                sink_name = "glimagesink/X11" if gpu_native_sink else "gtkglsink"
                 logger.info(
                     f"[Gst] GPU path enabled: decoder={gpu_decoder} "
-                    "NVDEC -> GL color -> gtkglsink"
+                    f"NVDEC -> GL color -> {sink_name}"
                 )
 
         if not self._using_gpu_filters:
@@ -291,14 +397,15 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             self._sink.set_property("force-aspect-ratio", False)
         except Exception:
             pass
-        self._video_widget = self._sink.get_property("widget")
-        if self._video_widget is None:
-            raise RuntimeError("gtksink widget is unavailable (no display?)")
-        # Fill the monitor until centercrop computes the real crop geometry.
-        self._video_widget.set_hexpand(True)
-        self._video_widget.set_vexpand(True)
-        # Set an explicit size so Gtk.Fixed shows the widget immediately.
-        self._video_widget.set_size_request(self.width, self.height)
+        if not self._using_gpu_filters:
+            self._video_widget = self._sink.get_property("widget")
+            if self._video_widget is None:
+                raise RuntimeError("gtksink widget is unavailable (no display?)")
+            # Fill the monitor until centercrop computes the real crop geometry.
+            self._video_widget.set_hexpand(True)
+            self._video_widget.set_vexpand(True)
+            # Set an explicit size so Gtk.Fixed shows the widget immediately.
+            self._video_widget.set_size_request(self.width, self.height)
 
         if not self._using_gpu_filters:
             self._video_balance = Gst.ElementFactory.make("videobalance")
@@ -398,10 +505,13 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         if use_gpu == self._using_gpu_filters:
             return True
 
+        new_gpu_native_sink = False
         if use_gpu:
-            new_sink = Gst.ElementFactory.make("gtkglsink", None)
+            new_sink, new_widget, new_gpu_native_sink = _new_gpu_sink_and_widget(
+                self.width, self.height
+            )
             new_filter, new_balance, new_gamma_shader = _build_gpu_filter_bin()
-            if new_sink is None or new_filter is None:
+            if new_sink is None or new_widget is None or new_filter is None:
                 logger.warning("[Gst] GPU path unavailable; retaining compatibility renderer")
                 return False
             new_gpu_filter = new_filter
@@ -418,7 +528,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             new_gpu_filter = None
             new_gamma_shader = None
 
-        new_widget = self._prepare_video_widget(new_sink)
+        if not use_gpu:
+            new_widget = self._prepare_video_widget(new_sink)
         if new_widget is None:
             logger.warning("[Gst] New video widget unavailable; retaining current renderer")
             return False
@@ -458,14 +569,16 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._gpu_filter = new_gpu_filter
         self._gpu_gamma_shader = new_gamma_shader
         self._gpu_decoder = gpu_decoder if use_gpu else None
+        self._gpu_native_sink = new_gpu_native_sink if use_gpu else False
         self._video_balance = new_balance
         self._gamma_element = new_gamma_element
         self._using_gpu_filters = use_gpu
         self.apply_video_adjustments(self._video_adjustments)
         self.schedule_centercrop(*self._last_dimensions)
+        sink_name = "glimagesink/X11" if new_gpu_native_sink else "gtkglsink"
         logger.info(
             f"[Gst] Switched renderer to {'GPU' if use_gpu else 'CPU'} path"
-            + (f" ({gpu_decoder})" if use_gpu else "")
+            + (f" ({gpu_decoder}, {sink_name})" if use_gpu else "")
         )
         return True
 
