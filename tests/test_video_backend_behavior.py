@@ -166,6 +166,26 @@ class BackendSelectionTests(unittest.TestCase):
             ("glimagesink", "gtkglsink"),
         )
 
+    def test_gpu_center_crop_idle_callback_is_one_shot(self):
+        video_widget = Mock()
+        viewport = Mock()
+        window = SimpleNamespace(
+            width=1920,
+            height=1080,
+            _fit_mode="cover",
+            _last_dimensions=(None, None),
+            _video_widget=video_widget,
+            _viewport=viewport,
+        )
+
+        self.assertFalse(
+            gst_video_player.GstPlayerWindow.centercrop(
+                window, 2560, 1440
+            )
+        )
+        video_widget.set_size_request.assert_called_once()
+        viewport.move.assert_called_once()
+
     def test_auto_uses_gpu_gstreamer_on_x11_when_gpu_path_exists(self):
         with (
             patch.dict(

@@ -970,7 +970,10 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             self._viewport.move(self._video_widget, geometry.x, geometry.y)
         except Exception:
             return False
-        return True
+        # schedule_centercrop uses this method as a GLib idle callback. A
+        # successful crop is complete work; returning True would make GLib
+        # invoke it forever and consume a full CPU core.
+        return False
 
     def schedule_centercrop(self, video_width=None, video_height=None, attempts=1, delay_ms=0):
         if video_width is not None and video_height is not None:
