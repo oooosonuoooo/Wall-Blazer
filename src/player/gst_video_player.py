@@ -53,9 +53,12 @@ _GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
 def _gpu_max_fps():
     """Choose a low-overhead presentation rate for GPU wallpaper playback."""
     try:
-        requested = int(os.environ.get("WALLBLAZER_GPU_MAX_FPS", "30"))
+        # A wallpaper does not need video-rate presentation. Keeping the
+        # default at 15 fps substantially reduces the GL presentation thread
+        # while NVDEC still decodes and the GPU still renders every frame.
+        requested = int(os.environ.get("WALLBLAZER_GPU_MAX_FPS", "15"))
     except (TypeError, ValueError):
-        requested = 30
+        requested = 15
     return max(15, min(requested, 60))
 
 

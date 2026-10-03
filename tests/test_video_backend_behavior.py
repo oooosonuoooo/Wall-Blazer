@@ -155,10 +155,12 @@ class BackendSelectionTests(unittest.TestCase):
         )
 
     def test_gpu_presentation_rate_is_bounded_for_wallpaper_playback(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gst_video_player._gpu_max_fps(), 15)
         with patch.dict(os.environ, {"WALLBLAZER_GPU_MAX_FPS": "120"}, clear=False):
             self.assertEqual(gst_video_player._gpu_max_fps(), 60)
         with patch.dict(os.environ, {"WALLBLAZER_GPU_MAX_FPS": "bad"}, clear=False):
-            self.assertEqual(gst_video_player._gpu_max_fps(), 30)
+            self.assertEqual(gst_video_player._gpu_max_fps(), 15)
 
     def test_gpu_render_path_prefers_native_x11_sink(self):
         self.assertEqual(
