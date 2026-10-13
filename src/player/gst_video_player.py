@@ -22,14 +22,14 @@ try:
     from menu import build_menu
     from player.fit_geometry import calculate_fit_geometry, normalize_fit_mode
     from player.video_player import VideoPlayer
-    from utils import get_vlc_hwdec_profile, probe_media_info
+    from utils import get_gpu_playback_source, get_vlc_hwdec_profile, probe_media_info
 except (ModuleNotFoundError, ImportError):
     from wallblazer.commons import *
     from wallblazer.ipc import publish_service
     from wallblazer.menu import build_menu
     from wallblazer.player.fit_geometry import calculate_fit_geometry, normalize_fit_mode
     from wallblazer.player.video_player import VideoPlayer
-    from wallblazer.utils import get_vlc_hwdec_profile, probe_media_info
+    from wallblazer.utils import get_gpu_playback_source, get_vlc_hwdec_profile, probe_media_info
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -158,7 +158,10 @@ def _gpu_decoder_for_source(source, adjustments=None):
         return None
     if str(os.environ.get("WALLBLAZER_FORCE_HWDEC", "")).strip().lower() == "none":
         return None
-    if not isinstance(source, str) or not os.path.isfile(source):
+    if not isinstance(source, str):
+        return None
+    source = get_gpu_playback_source(source)
+    if not os.path.isfile(source):
         return None
     if not _gpu_adjustments_allow_path(adjustments):
         return None
@@ -342,7 +345,10 @@ class ColorTintOverlay(Gtk.DrawingArea):
 
 class GstMedia:
     def __init__(self, source):
-        self.source = source
+        self.original_source = source
+        self.source = get_gpu_playback_source(source)
+        if self.source != source:
+            logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
         self.loop_video = False
         self.disable_audio = False
 
@@ -804,7 +810,11 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             _gpu_decoder_for_source(media.source, self._video_adjustments)
         )
         self._active_media = media
-        self._active_source = source if source is not None else media.source
+        self._active_source = (
+            source
+            if source is not None
+            else getattr(media, "original_source", media.source)
+        )
         self._rate_applied = False
         self._player.set_state(Gst.State.NULL)
         self._player.set_property("uri", self._source_to_uri(media.source))

@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ sys.path.insert(0, str(SRC_ROOT))
 from player.fit_geometry import calculate_fit_geometry
 from player import gst_video_player
 from player.video_player import PlayerWindow, VideoPlayer
+import utils
 import server
 
 
@@ -279,6 +281,89 @@ class BackendSelectionTests(unittest.TestCase):
         recover.assert_called_once_with()
         trace.assert_called_once()
         self.assertEqual(trace.call_args.args[0], "loop_recovery")
+
+
+class GpuPlaybackCacheTests(unittest.TestCase):
+    def test_unsupported_codec_uses_cached_nvenc_copy_and_preserves_original(self):
+        source_info = {
+            "codec": "av1",
+            "width": 3840,
+            "height": 2160,
+            "avg_frame_rate": "60/1",
+        }
+        cached_info = {
+            "codec": "h264",
+            "width": 1920,
+            "height": 1080,
+            "avg_frame_rate": "60/1",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "wallpaper.mkv"
+            source.write_bytes(b"original")
+
+            def fake_probe(path, force_refresh=False):
+                return source_info if str(path) == str(source) else cached_info
+
+            def fake_ffmpeg(args, timeout=None, low_priority=True):
+                Path(args[-1]).write_bytes(b"prepared")
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch.dict(os.environ, {"XDG_CACHE_HOME": temp_dir}, clear=False),
+                patch.object(utils, "probe_media_info", side_effect=fake_probe),
+                patch.object(utils, "_ffmpeg_run_quiet", side_effect=fake_ffmpeg) as run,
+            ):
+                result = utils.prepare_gpu_playback_video(str(source))
+                prepared_source = utils.get_gpu_playback_source(str(source))
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["encoder"], "h264_nvenc")
+            self.assertTrue(source.is_file())
+            self.assertEqual(prepared_source, result["output_path"])
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-c:v") + 1], "h264_nvenc")
+
+    def test_gst_media_keeps_original_identity_but_uses_cached_source(self):
+        with patch.object(
+            gst_video_player,
+            "get_gpu_playback_source",
+            return_value="/cache/wallpaper-h264.mp4",
+        ):
+            media = gst_video_player.GstMedia("/videos/wallpaper.mkv")
+
+        self.assertEqual(media.original_source, "/videos/wallpaper.mkv")
+        self.assertEqual(media.source, "/cache/wallpaper-h264.mp4")
+
+    def test_auto_preparation_defaults_to_available_gpu_and_can_be_disabled(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(server, "_gstreamer_gpu_path_available", return_value=True),
+        ):
+            self.assertTrue(server._is_gpu_playback_preparation_enabled())
+        with (
+            patch.dict(os.environ, {"WALLBLAZER_GPU_COMPAT_PREPARE": "0"}, clear=True),
+            patch.object(server, "_gstreamer_gpu_path_available", return_value=True),
+        ):
+            self.assertFalse(server._is_gpu_playback_preparation_enabled())
+
+    def test_gpu_preparation_collects_all_unique_playlist_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = [Path(temp_dir) / f"wallpaper-{index}.mkv" for index in range(4)]
+            for path in paths:
+                path.write_bytes(b"video")
+            app = server.WallBlazerServer.__new__(server.WallBlazerServer)
+            app.config = {
+                server.CONFIG_KEY_DATA_SOURCE: {"Default": str(paths[0])},
+                server.CONFIG_KEY_PLAYLIST_SELECTION: [str(paths[0]), str(paths[1])],
+                server.CONFIG_KEY_PLAYLIST_LIBRARY: {"Default": [str(paths[1]), str(paths[2])]},
+                server.CONFIG_KEY_MONITOR_PLAYLISTS: {"HDMI-0": [str(paths[2]), str(paths[3])]},
+            }
+
+            sources = app._configured_video_sources_for_gpu()
+
+        self.assertEqual(set(sources), {str(path) for path in paths})
 
 
 if __name__ == "__main__":

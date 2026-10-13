@@ -27,6 +27,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="3.7" date="2026-10-13" type="stable">
+      <description>
+        <ul>
+          <li>Prepare codecs unsupported by NVDEC in a background H.264 cache for smoother NVIDIA wallpaper playback.</li>
+          <li>Preserve original wallpaper files and reuse prepared copies across playlist playback.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.6" date="2025-01-03" type="stable">
       <description>
         <ul>

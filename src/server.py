@@ -83,7 +83,7 @@ try:
 
     from menu import show_systray_icon
     from monitor import *
-    from utils import ConfigUtil, EndSessionHandler, get_video_paths, run_runtime_self_repair, normalize_video_file, video_needs_normalization, is_usable_video_path, build_reverse_video
+    from utils import ConfigUtil, EndSessionHandler, get_video_paths, run_runtime_self_repair, normalize_video_file, video_needs_normalization, is_usable_video_path, build_reverse_video, prepare_gpu_playback_video
 except (ModuleNotFoundError, ImportError):
     from wallblazer.commons import *
     from wallblazer.ipc import get_service, publish_service
@@ -93,7 +93,7 @@ except (ModuleNotFoundError, ImportError):
     gst_video_player_available = gst_video_player_main is not None
     from wallblazer.menu import show_systray_icon
     from wallblazer.monitor import *
-    from wallblazer.utils import ConfigUtil, EndSessionHandler, get_video_paths, run_runtime_self_repair, normalize_video_file, video_needs_normalization, is_usable_video_path, build_reverse_video
+    from wallblazer.utils import ConfigUtil, EndSessionHandler, get_video_paths, run_runtime_self_repair, normalize_video_file, video_needs_normalization, is_usable_video_path, build_reverse_video, prepare_gpu_playback_video
 
 loop = GLib.MainLoop()
 logger = logging.getLogger(LOGGER_NAME)
@@ -221,10 +221,13 @@ def _is_truthy_env(var_name):
     return value in _TRUTHY_ENV_VALUES
 
 
-def _is_auto_normalize_enabled():
-    # Normalizing videos is expensive and can delay startup noticeably.
-    # Keep it opt-in for stable low-resource runtime behavior.
-    return _is_truthy_env("WALLBLAZER_AUTO_NORMALIZE")
+def _is_gpu_playback_preparation_enabled():
+    # An explicit environment value always wins. On a machine with the
+    # validated NVDEC/GL path, prepare unsupported codecs automatically so
+    # they do not fall back to continuous full-resolution CPU decoding.
+    if "WALLBLAZER_GPU_COMPAT_PREPARE" in os.environ:
+        return _is_truthy_env("WALLBLAZER_GPU_COMPAT_PREPARE")
+    return _gstreamer_gpu_path_available()
 
 
 def _safe_process_exitcode(proc):
@@ -370,6 +373,8 @@ class WallBlazerServer(object):
         self._reverse_prebuild_lock = threading.Lock()
         self._reverse_prebuild_pending = []
         self._reverse_prebuild_thread = None
+        self._gpu_prepare_generation = 0
+        self._gpu_prepare_thread = None
 
         # Player process
         self.reload()
@@ -581,35 +586,73 @@ class WallBlazerServer(object):
             self._reverse_prebuild_thread = threading.Thread(target=_worker, daemon=True)
             self._reverse_prebuild_thread.start()
 
-    def _normalize_active_video_sources(self):
-        if self.config.get(CONFIG_KEY_MODE) != MODE_VIDEO:
-            return
-        data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})
-        if not isinstance(data_source, dict):
-            return
+    def _configured_video_sources_for_gpu(self):
+        """Collect unique local paths across the active source and playlists."""
+        sources = []
+        seen = set()
 
-        normalized_cache = {}
-        changed = False
-        for monitor_name, source in list(data_source.items()):
-            if not is_usable_video_path(source):
-                continue
-            if source in normalized_cache:
-                new_source = normalized_cache[source]
+        def add_source(value):
+            if not isinstance(value, str) or not value or not is_usable_video_path(value):
+                return
+            identity = _canonical_path(value)
+            if identity and identity not in seen:
+                seen.add(identity)
+                sources.append(value)
+
+        for key in (
+            CONFIG_KEY_DATA_SOURCE,
+            CONFIG_KEY_PLAYLIST_SELECTION,
+            CONFIG_KEY_PLAYLIST_LIBRARY,
+            CONFIG_KEY_MONITOR_PLAYLISTS,
+        ):
+            value = self.config.get(key)
+            if isinstance(value, dict):
+                values = value.values()
+            elif isinstance(value, list):
+                values = value
             else:
-                new_source = source
-                if video_needs_normalization(source):
-                    result = normalize_video_file(source, delete_original=True)
-                    if result.get("ok"):
-                        new_source = result.get("output_path") or source
-                normalized_cache[source] = new_source
-            if new_source != source:
-                data_source[monitor_name] = new_source
-                changed = True
+                continue
+            for item in values:
+                if isinstance(item, list):
+                    for source in item:
+                        add_source(source)
+                else:
+                    add_source(item)
+        return sources
 
-        if changed:
-            self.config[CONFIG_KEY_DATA_SOURCE] = data_source
+    def _prepare_gpu_playback_sources(self, sources):
+        for source in sources:
+            if not isinstance(source, str) or not is_usable_video_path(source):
+                continue
+            try:
+                result = prepare_gpu_playback_video(source)
+            except Exception:
+                logger.exception("[GPU cache] Could not prepare a wallpaper source")
+                continue
+            if result.get("changed"):
+                logger.info(
+                    "[GPU cache] Prepared %s with %s for NVDEC playback",
+                    os.path.basename(source),
+                    result.get("encoder") or "H.264",
+                )
+            elif not result.get("ok"):
+                logger.warning(
+                    "[GPU cache] Keeping CPU-compatible fallback for %s: %s",
+                    os.path.basename(source),
+                    result.get("error") or "preparation failed",
+                )
 
-    def _setup_player(self, mode, data_source=None, monitor=None):
+    def _resume_player_after_gpu_preparation(
+        self, generation, mode, data_source, monitor
+    ):
+        if generation != self._gpu_prepare_generation:
+            return False
+        self._setup_player(
+            mode, data_source, monitor, _gpu_prepared=True
+        )
+        return False
+
+    def _setup_player(self, mode, data_source=None, monitor=None, _gpu_prepared=False):
         """Setup and run player"""
         logger.info(f"[Mode] {mode}")
         self.config[CONFIG_KEY_MODE] = mode
@@ -619,8 +662,40 @@ class WallBlazerServer(object):
             self.config[CONFIG_KEY_DATA_SOURCE][monitor] = data_source
         if data_source is not None:
             self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = data_source
-        if mode == MODE_VIDEO and _is_auto_normalize_enabled():
-            self._normalize_active_video_sources()
+
+        if mode == MODE_VIDEO and not _gpu_prepared and _is_gpu_playback_preparation_enabled():
+            sources = self._configured_video_sources_for_gpu()
+            if sources:
+                self._gpu_prepare_generation = getattr(
+                    self, "_gpu_prepare_generation", 0
+                ) + 1
+                generation = self._gpu_prepare_generation
+                self._save_config()
+
+                def _worker():
+                    self._prepare_gpu_playback_sources(sources)
+                    GLib.idle_add(
+                        self._resume_player_after_gpu_preparation,
+                        generation,
+                        mode,
+                        data_source,
+                        monitor,
+                    )
+
+                self._gpu_prepare_thread = threading.Thread(
+                    target=_worker,
+                    daemon=True,
+                    name="wallblazer-gpu-playback-cache",
+                )
+                self._gpu_prepare_thread.start()
+                logger.info(
+                    "[GPU cache] Preparing unsupported local wallpaper codecs in the background"
+                )
+                return True
+
+        self._gpu_prepare_generation = getattr(
+            self, "_gpu_prepare_generation", 0
+        ) + 1
         # Persist before launching player so it always reads the latest mode/source.
         self._save_config()
 

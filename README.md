@@ -63,7 +63,7 @@
   <li><strong>Seamless Playlist Switching:</strong> Preloads the next video in the background and switches ~0.5 seconds early to eliminate flickering and ensure instant transitions.</li>
   <li><strong>Custom Playlists:</strong> Create multiple named playlists, assign them to specific monitors, and customize intervals and shuffle modes.</li>
   <li><strong>Per-Mode Playback Speed:</strong> Tune single wallpaper speed, playlist forward speed, and reverse speed independently from <code>0.25x</code> to <code>4x</code>.</li>
-  <li><strong>GPU-First Playback:</strong> On NVIDIA X11, automatically selects the validated GStreamer CUDA/NVDEC plus GL path for supported H.264/HEVC/VP9 video, avoiding unstable VLC surface negotiation; it falls back to VLC/VAAPI/VDPAU/DRM/CPU when the GPU-native factories are unavailable. Unsupported codecs (for example AV1 on older GPUs) stay on the compatible CPU path. Set <code>WALLBLAZER_FORCE_HWDEC=none</code> to opt out.</li>
+  <li><strong>GPU-First Playback:</strong> On NVIDIA X11, automatically selects the validated GStreamer CUDA/NVDEC plus GL path for supported H.264/HEVC/VP9 video, avoiding unstable VLC surface negotiation. Unsupported local codecs (such as AV1 on GPUs without AV1 decoding) are prepared once in the background as cached 1080p H.264, using NVENC when available; originals stay untouched and subsequent playback uses NVDEC. Set <code>WALLBLAZER_GPU_COMPAT_PREPARE=0</code> to skip preparation or <code>WALLBLAZER_FORCE_HWDEC=none</code> to opt out of the GPU path.</li>
   <li><strong>Broad Video Preview:</strong> Employs multiple extraction strategies to generate previews even for difficult codecs and containers.</li>
 </ul>
 

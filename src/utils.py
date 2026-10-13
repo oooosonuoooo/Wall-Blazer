@@ -3,11 +3,13 @@ import logging
 import shlex
 import shutil
 import subprocess
+import os
 import pathlib
 import glob
 import threading
 import tempfile
 import math
+import hashlib
 
 import sys
 import gi
@@ -65,6 +67,10 @@ THUMB_CACHE_DIR = _resolve_thumb_cache_dir()
 _GPU_PROFILE_CACHE = None
 _MEDIA_INFO_CACHE = {}
 _MEDIA_INFO_CACHE_LOCK = threading.Lock()
+GPU_PLAYBACK_DECODABLE_CODECS = frozenset({"h264", "hevc", "vp9"})
+GPU_PLAYBACK_CACHE_VERSION = 1
+_GPU_PLAYBACK_CACHE_LOCKS = {}
+_GPU_PLAYBACK_CACHE_LOCKS_LOCK = threading.Lock()
 GPU_VENDOR_MAP = {
     "0x10de": "nvidia",
     "0x1002": "amd",
@@ -330,6 +336,181 @@ def probe_media_info(path, force_refresh=False):
     with _MEDIA_INFO_CACHE_LOCK:
         _MEDIA_INFO_CACHE[cache_key] = dict(info)
     return dict(info)
+
+
+def gpu_playback_cache_path(path, info=None):
+    """Return the versioned H.264 cache path for a local source video."""
+    if not isinstance(path, str) or not path or not os.path.isfile(path):
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+
+    info = info if isinstance(info, dict) else probe_media_info(path)
+    identity = "\0".join(
+        str(value or "")
+        for value in (
+            GPU_PLAYBACK_CACHE_VERSION,
+            os.path.realpath(path),
+            stat.st_size,
+            stat.st_mtime_ns,
+            info.get("codec"),
+            info.get("width"),
+            info.get("height"),
+            info.get("avg_frame_rate"),
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return os.path.join(
+        cache_home,
+        "wallblazer",
+        "gpu-playback",
+        f"v{GPU_PLAYBACK_CACHE_VERSION}-{digest}.mp4",
+    )
+
+
+def _valid_gpu_playback_cache(path):
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return False
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+    except OSError:
+        return False
+    info = probe_media_info(path, force_refresh=True)
+    return (
+        info.get("codec") == "h264"
+        and info.get("width") == 1920
+        and info.get("height") == 1080
+    )
+
+
+def get_gpu_playback_source(path):
+    """Use a prepared H.264 copy when NVDEC cannot decode the source codec."""
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return path
+    info = probe_media_info(path)
+    codec = str(info.get("codec") or "").strip().lower()
+    if codec in GPU_PLAYBACK_DECODABLE_CODECS:
+        return path
+    cache_path = gpu_playback_cache_path(path, info)
+    if cache_path and _valid_gpu_playback_cache(cache_path):
+        return cache_path
+    return path
+
+
+def _gpu_playback_cache_lock(path):
+    with _GPU_PLAYBACK_CACHE_LOCKS_LOCK:
+        return _GPU_PLAYBACK_CACHE_LOCKS.setdefault(path, threading.Lock())
+
+
+def prepare_gpu_playback_video(path, timeout=60 * 60):
+    """Prepare a source unsupported by NVDEC as a cached 1080p H.264 video.
+
+    The original file is never modified. NVENC is preferred for encoding; a
+    low-priority libx264 pass is used if this FFmpeg build cannot use NVENC.
+    """
+    result = {
+        "ok": False,
+        "changed": False,
+        "input_path": path,
+        "output_path": path,
+        "encoder": None,
+        "error": None,
+    }
+    if not is_usable_video_path(path):
+        result["error"] = "missing source video"
+        return result
+
+    info = probe_media_info(path)
+    codec = str(info.get("codec") or "").strip().lower()
+    if not codec:
+        result["error"] = "video codec could not be identified"
+        return result
+    if codec in GPU_PLAYBACK_DECODABLE_CODECS:
+        result["ok"] = True
+        return result
+
+    output_path = gpu_playback_cache_path(path, info)
+    if not output_path:
+        result["error"] = "could not create a cache path"
+        return result
+    result["output_path"] = output_path
+
+    with _gpu_playback_cache_lock(output_path):
+        if _valid_gpu_playback_cache(output_path):
+            result["ok"] = True
+            return result
+
+        cache_dir = os.path.dirname(output_path)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError as error:
+            result["error"] = str(error)
+            return result
+
+        tmp_target = (
+            f"{output_path[:-4]}.tmp-{os.getpid()}-"
+            f"{threading.get_ident()}.mp4"
+        )
+        vf = (
+            "scale=1920:1080:force_original_aspect_ratio=increase:"
+            "force_divisible_by=2:flags=lanczos,crop=1920:1080,setsar=1"
+        )
+        common_args = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", path,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-vf", vf,
+            "-fps_mode", "passthrough",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+        ]
+        encoder_options = {
+            "h264_nvenc": [
+                "-preset", "p5", "-tune", "hq", "-rc", "vbr",
+                "-cq", "18", "-b:v", "0",
+            ],
+            "libx264": ["-preset", "veryfast", "-crf", "18"],
+        }
+        try:
+            for encoder, options in encoder_options.items():
+                if os.path.exists(tmp_target):
+                    os.unlink(tmp_target)
+                command = common_args + ["-c:v", encoder] + options + [tmp_target]
+                try:
+                    completed = _ffmpeg_run_quiet(
+                        command, timeout=timeout, low_priority=True
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    completed = None
+                if (
+                    completed is None
+                    or completed.returncode != 0
+                    or not _valid_gpu_playback_cache(tmp_target)
+                ):
+                    continue
+
+                os.replace(tmp_target, output_path)
+                result.update(ok=True, changed=True, encoder=encoder)
+                return result
+
+            result["error"] = "FFmpeg could not create a valid H.264 cache"
+            return result
+        except OSError as error:
+            result["error"] = str(error)
+            return result
+        finally:
+            if os.path.exists(tmp_target):
+                try:
+                    os.unlink(tmp_target)
+                except OSError:
+                    pass
 
 
 def _ffmpeg_run_quiet(args, timeout=None, low_priority=True):
