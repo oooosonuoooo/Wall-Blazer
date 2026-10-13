@@ -822,7 +822,18 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def active_source(self):
         return self._active_source
 
-    def queue_media(self, media, source, base_source=None, phase="forward", video_width=None, video_height=None):
+    def queue_media(
+        self,
+        media,
+        source,
+        base_source=None,
+        phase="forward",
+        video_width=None,
+        video_height=None,
+        disable_audio=False,
+    ):
+        if disable_audio:
+            media.disable_audio = True
         self._queued_media = media
         self._queued_source = source
         self._queued_base = base_source if base_source else source

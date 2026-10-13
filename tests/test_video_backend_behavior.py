@@ -52,6 +52,28 @@ class VlcEndEventTests(unittest.TestCase):
 
 
 class PreloadTransitionTests(unittest.TestCase):
+    def test_gstreamer_queue_media_accepts_audio_policy(self):
+        media = SimpleNamespace(disable_audio=False)
+        window = SimpleNamespace()
+
+        gst_video_player.GstPlayerWindow.queue_media(
+            window,
+            media,
+            "/tmp/next.mp4",
+            "/tmp/base.mp4",
+            "forward",
+            1920,
+            1080,
+            disable_audio=True,
+        )
+
+        self.assertTrue(media.disable_audio)
+        self.assertIs(window._queued_media, media)
+        self.assertEqual(window._queued_source, "/tmp/next.mp4")
+        self.assertEqual(window._queued_base, "/tmp/base.mp4")
+        self.assertEqual(window._queued_phase, "forward")
+        self.assertEqual(window._queued_dimensions, (1920, 1080))
+
     def test_queue_media_starts_a_gpu_preload_with_audio_policy(self):
         start_preload = Mock()
         window = SimpleNamespace(_start_preload=start_preload)
