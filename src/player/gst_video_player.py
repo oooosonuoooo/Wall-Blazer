@@ -546,7 +546,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         old_filter = self._video_filter
         old_widget = self._video_widget
         try:
-            self._player.set_state(Gst.State.NULL)
+            if not self._set_pipeline_state_and_wait(Gst.State.NULL):
+                raise RuntimeError("GStreamer did not reach NULL before renderer change")
             self._player.set_property("video-sink", new_sink)
             self._player.set_property("video-filter", new_video_filter)
             if old_widget is not None and old_widget.get_parent() is self._viewport:
@@ -555,7 +556,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             new_widget.show()
         except Exception as e:
             try:
-                self._player.set_state(Gst.State.NULL)
+                self._set_pipeline_state_and_wait(Gst.State.NULL)
                 self._player.set_property("video-sink", old_sink)
                 self._player.set_property("video-filter", old_filter)
             except Exception:
@@ -627,6 +628,25 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             return state
         except Exception:
             return Gst.State.NULL
+
+    def _set_pipeline_state_and_wait(self, target_state, timeout=None):
+        """Wait until playbin has left its old media state before reconfiguration."""
+        if timeout is None:
+            timeout = 2 * Gst.SECOND
+        try:
+            requested = self._player.set_state(target_state)
+            if requested == Gst.StateChangeReturn.FAILURE:
+                return False
+            result, state, pending = self._player.get_state(timeout)
+            return (
+                result != Gst.StateChangeReturn.FAILURE
+                and state == target_state
+                and pending == Gst.State.VOID_PENDING
+            )
+        except Exception as e:
+            state_name = getattr(target_state, "value_nick", str(target_state))
+            logger.warning(f"[Gst] Could not settle pipeline at {state_name}: {e}")
+            return False
 
     def _query_position_ns(self):
         try:
@@ -804,10 +824,21 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
 
     def set_media(self, media, source=None):
         if media is None:
-            return
+            return False
         self._switch_render_path(
             _gpu_decoder_for_source(media.source, self._video_adjustments)
         )
+        # playbin may need a different source/demuxer for the next URI. Move it
+        # to READY and wait for teardown before changing URI, or rapid playlist
+        # advances can leave duplicate streamsynchronizer pads behind.
+        if not self._set_pipeline_state_and_wait(Gst.State.READY):
+            logger.warning("[Gst] Skipping media switch because playbin did not reach READY")
+            return False
+        try:
+            self._player.set_property("uri", self._source_to_uri(media.source))
+        except Exception as e:
+            logger.warning(f"[Gst] Could not set media URI: {e}")
+            return False
         self._active_media = media
         self._active_source = (
             source
@@ -815,9 +846,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             else getattr(media, "original_source", media.source)
         )
         self._rate_applied = False
-        self._player.set_state(Gst.State.NULL)
-        self._player.set_property("uri", self._source_to_uri(media.source))
         self._apply_current_audio_flags()
+        return True
 
     def active_source(self):
         return self._active_source
@@ -897,7 +927,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         phase = self._queued_phase
         video_width, video_height = self._queued_dimensions
         self.clear_queued_media()
-        self.set_media(media, source=source)
+        if self.set_media(media, source=source) is False:
+            self.keep_current_media_playing()
+            return None, None, None
         self.schedule_centercrop(video_width, video_height)
         if should_play:
             self.play()

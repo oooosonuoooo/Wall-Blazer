@@ -52,6 +52,24 @@ class VlcEndEventTests(unittest.TestCase):
 
 
 class PreloadTransitionTests(unittest.TestCase):
+    def test_gstreamer_waits_for_playbin_state_before_media_reconfiguration(self):
+        pipeline = Mock()
+        pipeline.set_state.return_value = gst_video_player.Gst.StateChangeReturn.ASYNC
+        pipeline.get_state.return_value = (
+            gst_video_player.Gst.StateChangeReturn.SUCCESS,
+            gst_video_player.Gst.State.READY,
+            gst_video_player.Gst.State.VOID_PENDING,
+        )
+        window = SimpleNamespace(_player=pipeline)
+
+        self.assertTrue(
+            gst_video_player.GstPlayerWindow._set_pipeline_state_and_wait(
+                window, gst_video_player.Gst.State.READY
+            )
+        )
+        pipeline.set_state.assert_called_once_with(gst_video_player.Gst.State.READY)
+        pipeline.get_state.assert_called_once_with(2 * gst_video_player.Gst.SECOND)
+
     def test_gstreamer_queue_media_accepts_audio_policy(self):
         media = SimpleNamespace(disable_audio=False)
         window = SimpleNamespace()
