@@ -51,13 +51,13 @@ _GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
 
 
 def _gpu_max_fps():
-    """Keep smooth source motion on the GPU-backed wallpaper path."""
+    """Balance smooth motion and low presentation overhead on the GPU path."""
     try:
-        # Hardware decode and the native GL sink keep full-rate presentation
-        # off the Python/GTK CPU path. Preserve up to 60 fps for smooth motion.
-        requested = int(os.environ.get("WALLBLAZER_GPU_MAX_FPS", "60"))
+        # 30 fps keeps wallpaper motion smooth while limiting presentation work.
+        # Users can raise the cap to 60 when they prefer source-rate playback.
+        requested = int(os.environ.get("WALLBLAZER_GPU_MAX_FPS", "30"))
     except (TypeError, ValueError):
-        requested = 60
+        requested = 30
     return max(15, min(requested, 60))
 
 
