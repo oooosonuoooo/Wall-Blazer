@@ -82,6 +82,16 @@ def _set_native_gl_window(sink, widget):
         window.ensure_native()
         xid = GdkX11.X11Window.get_xid(window)
         GstVideo.VideoOverlay.set_window_handle(sink, xid)
+        _update_native_gl_render_rectangle(sink, widget)
+        return True
+    except Exception as error:
+        logger.debug(f"[Gst] Could not embed glimagesink in X11 child: {error}")
+        return False
+
+
+def _update_native_gl_render_rectangle(sink, widget):
+    """Keep glimagesink's destination in step with the resized video widget."""
+    try:
         allocation = widget.get_allocation()
         GstVideo.VideoOverlay.set_render_rectangle(
             sink,
@@ -92,7 +102,7 @@ def _set_native_gl_window(sink, widget):
         )
         return True
     except Exception as error:
-        logger.debug(f"[Gst] Could not embed glimagesink in X11 child: {error}")
+        logger.debug(f"[Gst] Could not update glimagesink render rectangle: {error}")
         return False
 
 
@@ -105,11 +115,17 @@ def _new_native_gl_widget(sink, width, height):
     widget.set_hexpand(True)
     widget.set_vexpand(True)
     widget.set_size_request(width, height)
+    native_window_ready = {"value": False}
 
     def on_realize(realized_widget):
-        _set_native_gl_window(sink, realized_widget)
+        native_window_ready["value"] = _set_native_gl_window(sink, realized_widget)
+
+    def on_size_allocate(allocated_widget, _allocation):
+        if native_window_ready["value"]:
+            _update_native_gl_render_rectangle(sink, allocated_widget)
 
     widget.connect("realize", on_realize)
+    widget.connect("size-allocate", on_size_allocate)
     return widget
 
 
