@@ -656,6 +656,10 @@ class WallBlazerServer(object):
         """Setup and run player"""
         logger.info(f"[Mode] {mode}")
         self.config[CONFIG_KEY_MODE] = mode
+        self._gpu_prepare_generation = getattr(
+            self, "_gpu_prepare_generation", 0
+        ) + 1
+        generation = self._gpu_prepare_generation
 
         # Set data source if specified
         if data_source is not None and monitor:
@@ -666,36 +670,32 @@ class WallBlazerServer(object):
         if mode == MODE_VIDEO and not _gpu_prepared and _is_gpu_playback_preparation_enabled():
             sources = self._configured_video_sources_for_gpu()
             if sources:
-                self._gpu_prepare_generation = getattr(
-                    self, "_gpu_prepare_generation", 0
-                ) + 1
-                generation = self._gpu_prepare_generation
-                self._save_config()
+                prepare_thread = getattr(self, "_gpu_prepare_thread", None)
+                if prepare_thread is None or not prepare_thread.is_alive():
+                    def _worker():
+                        self._prepare_gpu_playback_sources(sources)
+                        GLib.idle_add(
+                            self._resume_player_after_gpu_preparation,
+                            generation,
+                            mode,
+                            data_source,
+                            monitor,
+                        )
 
-                def _worker():
-                    self._prepare_gpu_playback_sources(sources)
-                    GLib.idle_add(
-                        self._resume_player_after_gpu_preparation,
-                        generation,
-                        mode,
-                        data_source,
-                        monitor,
+                    self._gpu_prepare_thread = threading.Thread(
+                        target=_worker,
+                        daemon=True,
+                        name="wallblazer-gpu-playback-cache",
+                    )
+                    self._gpu_prepare_thread.start()
+                    logger.info(
+                        "[GPU cache] Preparing unsupported local wallpaper codecs while playback starts"
+                    )
+                else:
+                    logger.info(
+                        "[GPU cache] Continuing existing codec preparation while playback starts"
                     )
 
-                self._gpu_prepare_thread = threading.Thread(
-                    target=_worker,
-                    daemon=True,
-                    name="wallblazer-gpu-playback-cache",
-                )
-                self._gpu_prepare_thread.start()
-                logger.info(
-                    "[GPU cache] Preparing unsupported local wallpaper codecs in the background"
-                )
-                return True
-
-        self._gpu_prepare_generation = getattr(
-            self, "_gpu_prepare_generation", 0
-        ) + 1
         # Persist before launching player so it always reads the latest mode/source.
         self._save_config()
 
