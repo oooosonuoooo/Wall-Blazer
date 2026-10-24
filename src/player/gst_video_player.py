@@ -1,4 +1,6 @@
 import logging
+import ctypes
+import ctypes.util
 import os
 import pathlib
 import sys
@@ -48,6 +50,8 @@ _GPU_DECODER_FACTORIES = {
 # drop-only, so it throttles a 60 fps wallpaper without touching pixel memory.
 _GPU_FILTER_ELEMENTS = ("videorate", "glcolorconvert", "glcolorbalance")
 _GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
+_X11_LIBRARY = None
+_X11_DISPLAY = None
 
 
 def _gpu_max_fps():
@@ -82,6 +86,7 @@ def _set_native_gl_window(sink, widget):
         window.ensure_native()
         xid = GdkX11.X11Window.get_xid(window)
         GstVideo.VideoOverlay.set_window_handle(sink, xid)
+        _disable_sink_aspect_ratio(sink)
         _update_native_gl_render_rectangle(sink, widget)
         return True
     except Exception as error:
@@ -92,18 +97,108 @@ def _set_native_gl_window(sink, widget):
 def _update_native_gl_render_rectangle(sink, widget):
     """Keep glimagesink's destination in step with the resized video widget."""
     try:
-        allocation = widget.get_allocation()
+        rectangle = getattr(widget, "_wallblazer_render_rectangle", None)
+        if rectangle is None:
+            allocation = widget.get_allocation()
+            rectangle = (0, 0, allocation.width, allocation.height)
         GstVideo.VideoOverlay.set_render_rectangle(
             sink,
-            0,
-            0,
-            max(1, int(allocation.width)),
-            max(1, int(allocation.height)),
+            int(rectangle[0]),
+            int(rectangle[1]),
+            max(1, int(rectangle[2])),
+            max(1, int(rectangle[3])),
         )
         return True
     except Exception as error:
         logger.debug(f"[Gst] Could not update glimagesink render rectangle: {error}")
         return False
+
+
+def _get_x11_display(display_name=None):
+    """Open one lightweight Xlib connection for exact native window moves."""
+    global _X11_LIBRARY, _X11_DISPLAY
+    if _X11_DISPLAY:
+        return _X11_LIBRARY, _X11_DISPLAY
+    try:
+        library_name = ctypes.util.find_library("X11") or "libX11.so.6"
+        library = ctypes.CDLL(library_name)
+        library.XOpenDisplay.argtypes = (ctypes.c_char_p,)
+        library.XOpenDisplay.restype = ctypes.c_void_p
+        library.XMoveResizeWindow.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        )
+        library.XMoveResizeWindow.restype = ctypes.c_int
+        library.XFlush.argtypes = (ctypes.c_void_p,)
+        library.XFlush.restype = ctypes.c_int
+        library.XSync.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        library.XSync.restype = ctypes.c_int
+        if display_name:
+            os.putenv("DISPLAY", display_name)
+            authority_file = os.environ.get("XAUTHORITY")
+            if authority_file:
+                os.putenv("XAUTHORITY", authority_file)
+        encoded_name = display_name.encode() if display_name else None
+        display = library.XOpenDisplay(encoded_name)
+        if not display:
+            return None, None
+        _X11_LIBRARY = library
+        _X11_DISPLAY = display
+        return library, display
+    except Exception as error:
+        logger.debug(f"[Gst] Could not open Xlib display for native crop: {error}")
+        return None, None
+
+
+def _move_resize_native_gl_window(window, geometry):
+    """Apply crop geometry through Xlib so negative offsets are preserved."""
+    if GdkX11 is None or window is None or geometry is None:
+        return False
+    try:
+        display_name = window.get_display().get_name()
+        library, display = _get_x11_display(display_name)
+        if not display:
+            return False
+        xid = GdkX11.X11Window.get_xid(window)
+        x, y, width, height = (int(value) for value in geometry)
+        if width < 1 or height < 1:
+            return False
+        library.XMoveResizeWindow(display, xid, x, y, width, height)
+        library.XSync(display, 0)
+        return True
+    except Exception as error:
+        logger.debug(f"[Gst] Could not move native GL window with Xlib: {error}")
+        return False
+
+
+def _schedule_native_gl_window_move(widget):
+    """Move the child after GTK flushes allocation requests, coalescing moves."""
+    if getattr(widget, "_wallblazer_native_move_pending", False):
+        return
+    widget._wallblazer_native_move_pending = True
+
+    def apply_geometry():
+        widget._wallblazer_native_move_pending = False
+        geometry = getattr(widget, "_wallblazer_native_geometry", None)
+        window = widget.get_window()
+        if geometry is None or window is None:
+            return False
+        try:
+            window.ensure_native()
+            if not _move_resize_native_gl_window(window, geometry):
+                window.move_resize(*geometry)
+            _update_native_gl_render_rectangle(widget._wallblazer_sink, widget)
+        except Exception as error:
+            logger.debug(f"[Gst] Could not apply native crop geometry: {error}")
+        return False
+
+    # GTK may still have a queued GdkWindow move after the allocation signal.
+    # A short timeout lets that request reach X before the final crop offset.
+    GLib.timeout_add(75, apply_geometry)
 
 
 def _new_native_gl_widget(sink, width, height):
@@ -115,13 +210,28 @@ def _new_native_gl_widget(sink, width, height):
     widget.set_hexpand(True)
     widget.set_vexpand(True)
     widget.set_size_request(width, height)
+    widget._wallblazer_sink = sink
     native_window_ready = {"value": False}
 
     def on_realize(realized_widget):
         native_window_ready["value"] = _set_native_gl_window(sink, realized_widget)
+        if native_window_ready["value"] and getattr(
+            realized_widget,
+            "_wallblazer_native_geometry",
+            None,
+        ) is not None:
+            _schedule_native_gl_window_move(realized_widget)
 
     def on_size_allocate(allocated_widget, _allocation):
         if native_window_ready["value"]:
+            _disable_sink_aspect_ratio(sink)
+            geometry = getattr(
+                allocated_widget,
+                "_wallblazer_native_geometry",
+                None,
+            )
+            if geometry is not None:
+                _schedule_native_gl_window_move(allocated_widget)
             _update_native_gl_render_rectangle(sink, allocated_widget)
 
     widget.connect("realize", on_realize)
@@ -135,6 +245,7 @@ def _new_gpu_sink_and_widget(width, height):
         sink = Gst.ElementFactory.make("glimagesink", None)
         widget = _new_native_gl_widget(sink, width, height) if sink is not None else None
         if sink is not None and widget is not None:
+            _disable_sink_aspect_ratio(sink)
             return sink, widget, True
 
     sink = Gst.ElementFactory.make("gtkglsink", None)
@@ -146,10 +257,22 @@ def _new_gpu_sink_and_widget(width, height):
         widget = None
     if widget is None:
         return None, None, False
+    _disable_sink_aspect_ratio(sink)
     widget.set_hexpand(True)
     widget.set_vexpand(True)
     widget.set_size_request(width, height)
     return sink, widget, False
+
+
+def _disable_sink_aspect_ratio(sink):
+    """Let the GPU sink fill its assigned render rectangle."""
+    for target in (sink, sink.get_by_name("sink")):
+        if target is None:
+            continue
+        try:
+            target.set_property("force-aspect-ratio", False)
+        except Exception:
+            pass
 
 
 def _gpu_adjustments_allow_path(adjustments):
@@ -1022,6 +1145,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             # Dimensions not yet known — show the widget at full monitor size
             # so the window is not black while we wait for the video probe.
             try:
+                self._video_widget._wallblazer_native_geometry = None
                 self._video_widget.set_size_request(self.width, self.height)
                 self._viewport.move(self._video_widget, 0, 0)
             except Exception:
@@ -1036,11 +1160,52 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             video_height,
             self._fit_mode,
         )
-        self._video_widget.set_size_request(geometry.width, geometry.height)
-        try:
-            self._viewport.move(self._video_widget, geometry.x, geometry.y)
-        except Exception:
-            return False
+        if self._gpu_native_sink and self._fit_mode == "cover":
+            # Keep GTK's allocation at monitor size so its top-level window
+            # cannot grow to the cover-scaled video width.  Resize and offset
+            # the native X11 child after allocation; the parent then clips the
+            # centered video to the monitor bounds.
+            self._video_widget._wallblazer_render_rectangle = (
+                0,
+                0,
+                geometry.width,
+                geometry.height,
+            )
+            self._video_widget._wallblazer_native_geometry = (
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+            )
+            self._video_widget.set_size_request(self.width, self.height)
+            try:
+                self._viewport.move(self._video_widget, 0, 0)
+            except Exception:
+                return False
+            _schedule_native_gl_window_move(self._video_widget)
+            _update_native_gl_render_rectangle(self._sink, self._video_widget)
+        elif self._gpu_native_sink:
+            # The native child stays anchored to its monitor for contain and
+            # stretch; the positive fitted rectangle adds contain margins.
+            self._video_widget._wallblazer_native_geometry = None
+            self._video_widget._wallblazer_render_rectangle = (
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+            )
+            self._video_widget.set_size_request(self.width, self.height)
+            try:
+                self._viewport.move(self._video_widget, 0, 0)
+            except Exception:
+                return False
+            _update_native_gl_render_rectangle(self._sink, self._video_widget)
+        else:
+            self._video_widget.set_size_request(geometry.width, geometry.height)
+            try:
+                self._viewport.move(self._video_widget, geometry.x, geometry.y)
+            except Exception:
+                return False
         # schedule_centercrop uses this method as a GLib idle callback. A
         # successful crop is complete work; returning True would make GLib
         # invoke it forever and consume a full CPU core.
