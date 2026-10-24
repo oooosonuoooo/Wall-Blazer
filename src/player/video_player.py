@@ -46,6 +46,7 @@ INSTANT_PLAYLIST_SWITCH_LEAD_MS = 1600
 INSTANT_PLAYLIST_POLL_INTERVAL_MS = 80
 PRELOAD_POLL_INTERVAL_MS = 40
 PRELOAD_TIMEOUT_SEC = 12.0
+STARTUP_PLAYBACK_TIMEOUT_SEC = 30.0
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _LOW_END_MODE_ENV = "WALLBLAZER_LOW_END_MODE"
@@ -1265,6 +1266,7 @@ class VideoPlayer(BasePlayer):
         self._transition_trace_file = os.environ.get("WALLBLAZER_TRACE_FILE", "").strip()
         self._trace_throttle = {}
         self._playback_settle_until = {}
+        self._startup_playback_pending = {}
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
@@ -1869,6 +1871,7 @@ class VideoPlayer(BasePlayer):
             if not switched_source:
                 return
             if switched_base:
+                self._startup_playback_pending.pop(monitor_name, None)
                 self._reverse_state[monitor_name] = {
                     "base": switched_base,
                     "phase": switched_phase,
@@ -1915,6 +1918,8 @@ class VideoPlayer(BasePlayer):
         if monitor is None or window is None:
             return False
         if window.has_direct_switch_pending():
+            return True
+        if self._startup_playback_is_pending(monitor_name, window, "startup_end_ignored"):
             return True
         state = self._reverse_state.get(monitor_name, {})
         current_base = state.get("base")
@@ -1963,6 +1968,43 @@ class VideoPlayer(BasePlayer):
                 return monitor, window
         return None, None
 
+    def _startup_playback_is_pending(self, monitor_name, window, wait_event):
+        started_at = self._startup_playback_pending.get(monitor_name)
+        if started_at is None:
+            return False
+        if not self._should_playback_start():
+            # A user or window-state pause must not consume the startup grace
+            # period while the player is intentionally stopped.
+            self._startup_playback_pending[monitor_name] = time.monotonic()
+            return True
+        if window.is_playing():
+            self._startup_playback_pending.pop(monitor_name, None)
+            self._trace_transition("startup_playback_started", monitor_name)
+            return False
+        elapsed = time.monotonic() - started_at
+        if elapsed < STARTUP_PLAYBACK_TIMEOUT_SEC:
+            self._trace_transition(
+                wait_event,
+                monitor_name,
+                throttle_key=f"{monitor_name}:{wait_event}",
+                throttle_sec=1.0,
+                queued=window.queued_source(),
+                elapsed_sec=round(elapsed, 1),
+            )
+            return True
+        self._startup_playback_pending.pop(monitor_name, None)
+        self._trace_transition(
+            "startup_playback_timeout",
+            monitor_name,
+            queued=window.queued_source(),
+            elapsed_sec=round(elapsed, 1),
+        )
+        logger.warning(
+            f"[Playlist] Initial playback did not start on {monitor_name} within "
+            f"{STARTUP_PLAYBACK_TIMEOUT_SEC:.0f}s; allowing playlist recovery"
+        )
+        return False
+
     def _playlist_tick(self, monitor_name):
         self._trace_transition(
             "tick_enter",
@@ -1991,6 +2033,8 @@ class VideoPlayer(BasePlayer):
         if not self._needs_transition_for_monitor(monitor_name, current_base):
             return False
         if not self._should_playback_start():
+            if monitor_name in self._startup_playback_pending:
+                self._startup_playback_pending[monitor_name] = time.monotonic()
             self._trace_transition(
                 "tick_playback_blocked",
                 monitor_name,
@@ -2001,6 +2045,10 @@ class VideoPlayer(BasePlayer):
                 is_any_fullscreen=self.is_any_fullscreen,
                 is_paused_by_user=self.is_paused_by_user,
             )
+            return True
+        if self._startup_playback_is_pending(
+            monitor_name, window, "startup_waiting_for_playback"
+        ):
             return True
         settle_until = self._playback_settle_until.get(monitor_name, 0.0)
         if settle_until > time.monotonic():
@@ -2144,6 +2192,7 @@ class VideoPlayer(BasePlayer):
         monitor, window = self._find_monitor_window(monitor_name)
         if monitor is None or window is None or not switched_base:
             return
+        self._startup_playback_pending.pop(monitor_name, None)
         self._reverse_state[monitor_name] = {
             "base": switched_base,
             "phase": switched_phase or "forward",
@@ -2245,6 +2294,13 @@ class VideoPlayer(BasePlayer):
                         "base": base_source,
                         "phase": "forward",
                     }
+                    self._startup_playback_pending.pop(monitor_name, None)
+                    if needs_transition:
+                        # Both playback backends can report not-playing while
+                        # the selected clip is still opening. Wait for its
+                        # first confirmed playback before a shuffled successor
+                        # can replace it.
+                        self._startup_playback_pending[monitor_name] = time.monotonic()
                     window.set_media(media, source=base_source)
                     self._apply_window_profile(monitor, window, "forward")
                     window.set_position(0.0)
