@@ -375,6 +375,8 @@ class WallBlazerServer(object):
         self._reverse_prebuild_thread = None
         self._gpu_prepare_generation = 0
         self._gpu_prepare_thread = None
+        self._gpu_prepare_cancel_event = None
+        self._pending_gpu_setup = None
 
         # Player process
         self.reload()
@@ -587,7 +589,7 @@ class WallBlazerServer(object):
             self._reverse_prebuild_thread.start()
 
     def _configured_video_sources_for_gpu(self):
-        """Collect unique local paths across the active source and playlists."""
+        """Collect only the local videos currently assigned to displays."""
         sources = []
         seen = set()
 
@@ -599,36 +601,28 @@ class WallBlazerServer(object):
                 seen.add(identity)
                 sources.append(value)
 
-        for key in (
-            CONFIG_KEY_DATA_SOURCE,
-            CONFIG_KEY_PLAYLIST_SELECTION,
-            CONFIG_KEY_PLAYLIST_LIBRARY,
-            CONFIG_KEY_MONITOR_PLAYLISTS,
-        ):
-            value = self.config.get(key)
-            if isinstance(value, dict):
-                values = value.values()
-            elif isinstance(value, list):
-                values = value
-            else:
-                continue
-            for item in values:
-                if isinstance(item, list):
-                    for source in item:
-                        add_source(source)
-                else:
-                    add_source(item)
+        value = self.config.get(CONFIG_KEY_DATA_SOURCE)
+        if isinstance(value, dict):
+            for source in value.values():
+                add_source(source)
         return sources
 
-    def _prepare_gpu_playback_sources(self, sources):
+    def _prepare_gpu_playback_sources(self, sources, cancel_event=None):
         for source in sources:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             if not isinstance(source, str) or not is_usable_video_path(source):
                 continue
             try:
-                result = prepare_gpu_playback_video(source)
+                result = prepare_gpu_playback_video(
+                    source,
+                    cancel_event=cancel_event,
+                )
             except Exception:
                 logger.exception("[GPU cache] Could not prepare a wallpaper source")
-                continue
+                return False
+            if result.get("cancelled"):
+                return False
             if result.get("changed"):
                 logger.info(
                     "[GPU cache] Prepared %s with %s for NVDEC playback",
@@ -637,19 +631,84 @@ class WallBlazerServer(object):
                 )
             elif not result.get("ok"):
                 logger.warning(
-                    "[GPU cache] Keeping CPU-compatible fallback for %s: %s",
+                    "[GPU cache] Skipping %s to avoid a CPU-decoded fallback: %s",
                     os.path.basename(source),
                     result.get("error") or "preparation failed",
                 )
+                return False
+        return True
 
-    def _resume_player_after_gpu_preparation(
-        self, generation, mode, data_source, monitor
-    ):
-        if generation != self._gpu_prepare_generation:
-            return False
-        self._setup_player(
-            mode, data_source, monitor, _gpu_prepared=True
+    def _start_gpu_playback_preparation(self, request, sources):
+        generation, mode, data_source, monitor = request
+        cancel_event = threading.Event()
+        self._gpu_prepare_cancel_event = cancel_event
+        self._pending_gpu_setup = request
+
+        def _worker():
+            prepared = self._prepare_gpu_playback_sources(sources, cancel_event)
+            GLib.idle_add(
+                self._finish_gpu_playback_preparation,
+                request,
+                cancel_event,
+                prepared,
+            )
+
+        self._gpu_prepare_thread = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="wallblazer-gpu-playback-cache",
         )
+        self._gpu_prepare_thread.start()
+        logger.info(
+            "[GPU cache] Preparing active local video before playback; playlist items are prepared on demand"
+        )
+
+    def _finish_gpu_playback_preparation(self, request, cancel_event, prepared):
+        if cancel_event is not self._gpu_prepare_cancel_event:
+            return False
+
+        prepare_thread = self._gpu_prepare_thread
+        if prepare_thread is not None and prepare_thread.is_alive():
+            GLib.timeout_add(
+                50,
+                self._finish_gpu_playback_preparation,
+                request,
+                cancel_event,
+                prepared,
+            )
+            return False
+
+        self._gpu_prepare_thread = None
+        self._gpu_prepare_cancel_event = None
+        generation, mode, data_source, monitor = request
+        if cancel_event.is_set() or generation != self._gpu_prepare_generation:
+            pending = self._pending_gpu_setup
+            self._pending_gpu_setup = None
+            if pending is not None and pending[0] == self._gpu_prepare_generation:
+                pending_sources = self._configured_video_sources_for_gpu()
+                if (
+                    pending[1] == MODE_VIDEO
+                    and _is_gpu_playback_preparation_enabled()
+                    and pending_sources
+                ):
+                    self._start_gpu_playback_preparation(pending, pending_sources)
+                else:
+                    self._setup_player(
+                        pending[1],
+                        pending[2],
+                        pending[3],
+                        _gpu_prepared=True,
+                    )
+            return False
+
+        self._pending_gpu_setup = None
+        if not prepared:
+            logger.warning(
+                "[GPU cache] Playback was not started because a GPU-compatible source could not be prepared"
+            )
+            return False
+
+        self._setup_player(mode, data_source, monitor, _gpu_prepared=True)
         return False
 
     def _setup_player(self, mode, data_source=None, monitor=None, _gpu_prepared=False):
@@ -667,34 +726,41 @@ class WallBlazerServer(object):
         if data_source is not None:
             self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = data_source
 
-        if mode == MODE_VIDEO and not _gpu_prepared and _is_gpu_playback_preparation_enabled():
-            sources = self._configured_video_sources_for_gpu()
-            if sources:
-                prepare_thread = getattr(self, "_gpu_prepare_thread", None)
-                if prepare_thread is None or not prepare_thread.is_alive():
-                    def _worker():
-                        self._prepare_gpu_playback_sources(sources)
-                        GLib.idle_add(
-                            self._resume_player_after_gpu_preparation,
+        if not _gpu_prepared:
+            self._pending_gpu_setup = None
+            prepare_thread = getattr(self, "_gpu_prepare_thread", None)
+            if prepare_thread is not None and prepare_thread.is_alive():
+                cancel_event = getattr(self, "_gpu_prepare_cancel_event", None)
+                if cancel_event is not None:
+                    cancel_event.set()
+
+                if (
+                    mode == MODE_VIDEO
+                    and _is_gpu_playback_preparation_enabled()
+                ):
+                    sources = self._configured_video_sources_for_gpu()
+                    if sources:
+                        self._pending_gpu_setup = (
                             generation,
                             mode,
                             data_source,
                             monitor,
                         )
+                        self._save_config()
+                        logger.info(
+                            "[GPU cache] Cancelling stale preparation before switching the active video"
+                        )
+                        return
 
-                    self._gpu_prepare_thread = threading.Thread(
-                        target=_worker,
-                        daemon=True,
-                        name="wallblazer-gpu-playback-cache",
-                    )
-                    self._gpu_prepare_thread.start()
-                    logger.info(
-                        "[GPU cache] Preparing unsupported local wallpaper codecs while playback starts"
-                    )
-                else:
-                    logger.info(
-                        "[GPU cache] Continuing existing codec preparation while playback starts"
-                    )
+        if mode == MODE_VIDEO and not _gpu_prepared and _is_gpu_playback_preparation_enabled():
+            sources = self._configured_video_sources_for_gpu()
+            if sources:
+                self._save_config()
+                self._start_gpu_playback_preparation(
+                    (generation, mode, data_source, monitor),
+                    sources,
+                )
+                return
 
         # Persist before launching player so it always reads the latest mode/source.
         self._save_config()

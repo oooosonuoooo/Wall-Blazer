@@ -10,6 +10,7 @@ import threading
 import tempfile
 import math
 import hashlib
+import time
 
 import sys
 import gi
@@ -408,20 +409,25 @@ def _gpu_playback_cache_lock(path):
         return _GPU_PLAYBACK_CACHE_LOCKS.setdefault(path, threading.Lock())
 
 
-def prepare_gpu_playback_video(path, timeout=60 * 60):
+def prepare_gpu_playback_video(path, timeout=60 * 60, cancel_event=None):
     """Prepare a source unsupported by NVDEC as a cached 1080p H.264 video.
 
-    The original file is never modified. NVENC is preferred for encoding; a
-    low-priority libx264 pass is used if this FFmpeg build cannot use NVENC.
+    The original file is never modified. Decoding is limited to one CPU thread;
+    scaling and H.264 encoding use CUDA/NVENC. Unsupported GPU setup fails
+    cleanly instead of falling back to a CPU encoder.
     """
     result = {
         "ok": False,
         "changed": False,
+        "cancelled": False,
         "input_path": path,
         "output_path": path,
         "encoder": None,
         "error": None,
     }
+    if cancel_event is not None and cancel_event.is_set():
+        result.update(cancelled=True, error="preparation cancelled")
+        return result
     if not is_usable_video_path(path):
         result["error"] = "missing source video"
         return result
@@ -442,6 +448,9 @@ def prepare_gpu_playback_video(path, timeout=60 * 60):
     result["output_path"] = output_path
 
     with _gpu_playback_cache_lock(output_path):
+        if cancel_event is not None and cancel_event.is_set():
+            result.update(cancelled=True, error="preparation cancelled")
+            return result
         if _valid_gpu_playback_cache(output_path):
             result["ok"] = True
             return result
@@ -458,16 +467,20 @@ def prepare_gpu_playback_video(path, timeout=60 * 60):
             f"{threading.get_ident()}.mp4"
         )
         vf = (
-            "scale=1920:1080:force_original_aspect_ratio=increase:"
-            "force_divisible_by=2:flags=lanczos,crop=1920:1080,setsar=1"
+            "fps=30,hwupload_cuda,"
+            "scale_cuda=1920:1080:force_original_aspect_ratio=increase:"
+            "force_divisible_by=2:interp_algo=lanczos:format=nv12,"
+            "hwdownload,format=nv12,crop=1920:1080,setsar=1"
         )
         common_args = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-filter_threads", "1", "-filter_complex_threads", "1",
+            "-threads:v", "1",
             "-i", path,
             "-map", "0:v:0", "-map", "0:a?",
             "-vf", vf,
             "-fps_mode", "passthrough",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-profile:v", "high", "-pix_fmt", "nv12",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
         ]
@@ -476,19 +489,28 @@ def prepare_gpu_playback_video(path, timeout=60 * 60):
                 "-preset", "p5", "-tune", "hq", "-rc", "vbr",
                 "-cq", "18", "-b:v", "0",
             ],
-            "libx264": ["-preset", "veryfast", "-crf", "18"],
         }
         try:
             for encoder, options in encoder_options.items():
+                if cancel_event is not None and cancel_event.is_set():
+                    result.update(cancelled=True, error="preparation cancelled")
+                    return result
                 if os.path.exists(tmp_target):
                     os.unlink(tmp_target)
                 command = common_args + ["-c:v", encoder] + options + [tmp_target]
                 try:
-                    completed = _ffmpeg_run_quiet(
-                        command, timeout=timeout, low_priority=True
-                    )
+                    run_options = {
+                        "timeout": timeout,
+                        "low_priority": True,
+                    }
+                    if cancel_event is not None:
+                        run_options["cancel_event"] = cancel_event
+                    completed = _ffmpeg_run_quiet(command, **run_options)
                 except (OSError, subprocess.TimeoutExpired):
                     completed = None
+                if cancel_event is not None and cancel_event.is_set():
+                    result.update(cancelled=True, error="preparation cancelled")
+                    return result
                 if (
                     completed is None
                     or completed.returncode != 0
@@ -500,7 +522,9 @@ def prepare_gpu_playback_video(path, timeout=60 * 60):
                 result.update(ok=True, changed=True, encoder=encoder)
                 return result
 
-            result["error"] = "FFmpeg could not create a valid H.264 cache"
+            result["error"] = (
+                "CUDA scaling or NVENC encoding could not create a valid H.264 cache"
+            )
             return result
         except OSError as error:
             result["error"] = str(error)
@@ -513,7 +537,7 @@ def prepare_gpu_playback_video(path, timeout=60 * 60):
                     pass
 
 
-def _ffmpeg_run_quiet(args, timeout=None, low_priority=True):
+def _ffmpeg_run_quiet(args, timeout=None, low_priority=True, cancel_event=None):
     run_kwargs = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
@@ -524,11 +548,44 @@ def _ffmpeg_run_quiet(args, timeout=None, low_priority=True):
     if low_priority and sys.platform != "win32":
         def _lower_priority():
             try:
-                os.nice(10)
+                os.nice(15)
             except OSError:
                 pass
         run_kwargs["preexec_fn"] = _lower_priority
-    return subprocess.run(args, **run_kwargs)
+    if cancel_event is None:
+        return subprocess.run(args, **run_kwargs)
+
+    popen_kwargs = {
+        key: value
+        for key, value in run_kwargs.items()
+        if key not in {"check", "timeout"}
+    }
+    process = subprocess.Popen(args, **popen_kwargs)
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        if cancel_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            return subprocess.CompletedProcess(args, process.returncode)
+
+        wait_timeout = 0.25
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(args, timeout)
+            wait_timeout = min(wait_timeout, remaining)
+
+        try:
+            returncode = process.wait(timeout=wait_timeout)
+            return subprocess.CompletedProcess(args, returncode)
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _ffconcat_quote(path):

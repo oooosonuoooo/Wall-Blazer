@@ -390,22 +390,25 @@ class GpuPlaybackCacheTests(unittest.TestCase):
         ):
             self.assertFalse(server._is_gpu_playback_preparation_enabled())
 
-    def test_gpu_preparation_collects_all_unique_playlist_sources(self):
+    def test_gpu_preparation_collects_only_active_display_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = [Path(temp_dir) / f"wallpaper-{index}.mkv" for index in range(4)]
             for path in paths:
                 path.write_bytes(b"video")
             app = server.WallBlazerServer.__new__(server.WallBlazerServer)
             app.config = {
-                server.CONFIG_KEY_DATA_SOURCE: {"Default": str(paths[0])},
+                server.CONFIG_KEY_DATA_SOURCE: {
+                    "Default": str(paths[0]),
+                    "HDMI-0": str(paths[1]),
+                },
                 server.CONFIG_KEY_PLAYLIST_SELECTION: [str(paths[0]), str(paths[1])],
-                server.CONFIG_KEY_PLAYLIST_LIBRARY: {"Default": [str(paths[1]), str(paths[2])]},
-                server.CONFIG_KEY_MONITOR_PLAYLISTS: {"HDMI-0": [str(paths[2]), str(paths[3])]},
+                server.CONFIG_KEY_PLAYLIST_LIBRARY: {"Default": [str(paths[2])]},
+                server.CONFIG_KEY_MONITOR_PLAYLISTS: {"HDMI-0": [str(paths[3])]},
             }
 
             sources = app._configured_video_sources_for_gpu()
 
-        self.assertEqual(set(sources), {str(path) for path in paths})
+        self.assertEqual(set(sources), {str(path) for path in paths[:2]})
 
 
 if __name__ == "__main__":
