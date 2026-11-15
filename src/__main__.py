@@ -14,17 +14,15 @@ try:
     from commons import *
     from utils import (
         is_gnome, is_wayland, is_nvidia_proprietary, is_vdpau_ok, is_flatpak,
-        run_runtime_self_repair, purge_local_app_data,
+        run_runtime_self_repair, purge_local_app_data, setup_autostart,
     )
-    import server
 except (ModuleNotFoundError, ImportError):
     # These are imports for installed/Flatpak mode
     from wallblazer.commons import *
     from wallblazer.utils import (
         is_gnome, is_wayland, is_nvidia_proprietary, is_vdpau_ok, is_flatpak,
-        run_runtime_self_repair, purge_local_app_data,
+        run_runtime_self_repair, purge_local_app_data, setup_autostart,
     )
-    from wallblazer import server
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -84,6 +82,9 @@ def main(version="devel", pkgdatadir="/app/share/wallblazer", localedir="/app/sh
     parser.add_argument("-r", "--reset", action="store_true", help="Reset user configuration.")
     parser.add_argument("--repair", action="store_true",
                         help="Run runtime health checks and self-repair tasks, then exit.")
+    if sys.platform != "win32":
+        parser.add_argument("--enable-autostart", action="store_true",
+                            help="Start the wallpaper in the background at desktop login.")
     parser.add_argument("--purge-device-data", action="store_true",
                         help="Clear local file paths, playlist state, and cached previews from app data.")
     # Internal flag: launch only the GUI window (called by server via subprocess.Popen)
@@ -91,6 +92,10 @@ def main(version="devel", pkgdatadir="/app/share/wallblazer", localedir="/app/sh
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
     _configure_logging(args)
+
+    if getattr(args, "enable_autostart", False):
+        setup_autostart(True)
+        return
 
     # --gui-only mode: just open the GTK control panel, no server logic
     if args.gui_only:
@@ -136,24 +141,19 @@ def main(version="devel", pkgdatadir="/app/share/wallblazer", localedir="/app/sh
         )
         return
 
-    # Log system information
-    sys_info = []
-    sys_info.append("--- System information ---")
-    sys_info.append(f"is_gnome = {is_gnome()}")
-    sys_info.append(f"is_wayland = {is_wayland()}")
-    sys_info.append(f"is_nvidia_proprietary = {is_nvidia_proprietary()}")
-    sys_info.append(f"is_vdpau_ok = {is_vdpau_ok()}")
-    sys_info.append(f"is_flatpak = {is_flatpak()}")
-    sys_info.append("--------------------------")
-    sys_info_str = "\n".join(sys_info)
-    logger.info(f"Wall Blazer v{version}\n{sys_info_str}")
-    logger.info(f"[Args] {vars(args)}")
-
-    # Make Wall Blazer runtime folders and normalize config
-    run_runtime_self_repair()
+    if args.debug:
+        logger.debug(
+            "Wall Blazer v%s: gnome=%s wayland=%s nvidia=%s vdpau=%s flatpak=%s",
+            version, is_gnome(), is_wayland(), is_nvidia_proprietary(),
+            is_vdpau_ok(), is_flatpak(),
+        )
 
     # Clear sys.argv as it has influence to the Gtk.Application
     sys.argv = [sys.argv[0]]
+    try:
+        import server
+    except (ModuleNotFoundError, ImportError):
+        from wallblazer import server
     server.main(version, pkgdatadir, localedir, args)
 
 

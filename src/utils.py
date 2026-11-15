@@ -382,11 +382,14 @@ def _valid_gpu_playback_cache(path):
             return False
     except OSError:
         return False
-    info = probe_media_info(path, force_refresh=True)
+    # The probe cache key includes file size and mtime. A completed cache
+    # video can be reused by the player without starting ffprobe on each lookup.
+    info = probe_media_info(path)
+    width, height = info.get("width"), info.get("height")
     return (
         info.get("codec") == "h264"
-        and info.get("width") == 1920
-        and info.get("height") == 1080
+        and isinstance(width, int) and 0 < width <= 1920
+        and isinstance(height, int) and 0 < height <= 1080
     )
 
 
@@ -410,7 +413,7 @@ def _gpu_playback_cache_lock(path):
 
 
 def prepare_gpu_playback_video(path, timeout=60 * 60, cancel_event=None):
-    """Prepare a source unsupported by NVDEC as a cached 1080p H.264 video.
+    """Prepare a source unsupported by NVDEC as a cached H.264 video.
 
     The original file is never modified. Decoding is limited to one CPU thread;
     scaling and H.264 encoding use CUDA/NVENC. Unsupported GPU setup fails
@@ -466,28 +469,31 @@ def prepare_gpu_playback_video(path, timeout=60 * 60, cancel_event=None):
             f"{output_path[:-4]}.tmp-{os.getpid()}-"
             f"{threading.get_ident()}.mp4"
         )
+        # Preserve the source framing for the player's Cover/Contain/Stretch
+        # options. Once uploaded, the scaled frames go straight into NVENC.
         vf = (
             "fps=30,hwupload_cuda,"
-            "scale_cuda=1920:1080:force_original_aspect_ratio=increase:"
-            "force_divisible_by=2:interp_algo=lanczos:format=nv12,"
-            "hwdownload,format=nv12,crop=1920:1080,setsar=1"
+            "scale_cuda=w='min(iw,1920)':h='min(ih,1080)':"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            "interp_algo=lanczos:format=nv12"
         )
         common_args = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-filter_threads", "1", "-filter_complex_threads", "1",
             "-threads:v", "1",
             "-i", path,
             "-map", "0:v:0", "-map", "0:a?",
             "-vf", vf,
             "-fps_mode", "passthrough",
-            "-profile:v", "high", "-pix_fmt", "nv12",
+            "-profile:v", "high",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
         ]
         encoder_options = {
             "h264_nvenc": [
-                "-preset", "p5", "-tune", "hq", "-rc", "vbr",
-                "-cq", "18", "-b:v", "0",
+                "-preset", "p4", "-tune", "hq", "-rc", "vbr",
+                "-cq", "18", "-b:v", "0", "-rc-lookahead", "0",
+                "-bf", "0", "-surfaces", "8",
             ],
         }
         try:
@@ -545,13 +551,9 @@ def _ffmpeg_run_quiet(args, timeout=None, low_priority=True, cancel_event=None):
     }
     if timeout is not None:
         run_kwargs["timeout"] = timeout
-    if low_priority and sys.platform != "win32":
-        def _lower_priority():
-            try:
-                os.nice(19)
-            except OSError:
-                pass
-        run_kwargs["preexec_fn"] = _lower_priority
+    nice = shutil.which("nice") if low_priority and sys.platform != "win32" else None
+    if nice:
+        args = [nice, "-n", "19", *args]
     if cancel_event is None:
         return subprocess.run(args, **run_kwargs)
 
@@ -1485,6 +1487,22 @@ def get_gpu_usage_snapshot():
     return snapshot
 
 
+def is_autostart_enabled():
+    entry = GLib.KeyFile()
+    group = GLib.KEY_FILE_DESKTOP_GROUP
+    try:
+        entry.load_from_file(AUTOSTART_DESKTOP_PATH, GLib.KeyFileFlags.NONE)
+        if not entry.get_string(group, "Exec").strip():
+            return False
+        keys, _ = entry.get_keys(group)
+        for key, disabled in (("Hidden", True), ("X-GNOME-Autostart-enabled", False)):
+            if key in keys and entry.get_boolean(group, key) == disabled:
+                return False
+    except GLib.Error:
+        return False
+    return True
+
+
 def setup_autostart(autostart):
     if sys.platform == "win32":
         return
@@ -1511,25 +1529,25 @@ def setup_autostart(autostart):
                 f"[Utils] autostart={autostart}, request_background sucess={portal.request_background_finish(result)}"),  # callback
             None,  # user_data
         )
-        # Bug 4/9: return here so we don't fall through to the non-Flatpak
-        # os.makedirs + file write code below, which would unconditionally
-        # re-create the desktop file even when autostart=False.
         return
-    os.makedirs(AUTOSTART_DIR, exist_ok=True)
     logger.debug(
         f"[Utils] autostart={autostart}, path={AUTOSTART_DESKTOP_PATH}")
     if autostart:
-        with open(AUTOSTART_DESKTOP_PATH, mode='w') as f:
-            if is_flatpak():
-                # Write files to the sandbox as well, for the following reasons:
-                # (1) So that we know if autostart is enabled by looking the file in sandbox
-                # (2) Acts as a fallback in case the portal doesn't work
-                f.write(AUTOSTART_DESKTOP_CONTENT_FLATPAK)
-            else:
-                f.write(AUTOSTART_DESKTOP_CONTENT)
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        entry = GLib.KeyFile()
+        entry.load_from_data(AUTOSTART_DESKTOP_CONTENT, len(AUTOSTART_DESKTOP_CONTENT),
+                             GLib.KeyFileFlags.NONE)
+        launcher = os.environ.get("WALLBLAZER_LAUNCHER") or shutil.which("wallblazer")
+        if launcher:
+            group = GLib.KEY_FILE_DESKTOP_GROUP
+            command = launcher.replace("%", "%%")
+            for char in ('\\', '"', '`', '$'):
+                command = command.replace(char, '\\' + char)
+            entry.set_string(group, "Exec", f'"{command}" -b')
+            entry.set_string(group, "TryExec", launcher)
+        entry.save_to_file(AUTOSTART_DESKTOP_PATH)
     else:
-        if os.path.isfile(AUTOSTART_DESKTOP_PATH):
-            os.remove(AUTOSTART_DESKTOP_PATH)
+        pathlib.Path(AUTOSTART_DESKTOP_PATH).unlink(missing_ok=True)
 
 
 # Opt 2: in-memory cache of paths already confirmed to contain a video stream.
@@ -1586,20 +1604,19 @@ def get_video_paths():
         filepath = os.path.join(VIDEO_WALLPAPER_DIR, filename)
         if not is_usable_video_path(filepath):
             continue
+        if pathlib.Path(filename).suffix.lower() in VIDEO_FILE_EXTENSIONS:
+            file_list.append(filepath)
+            continue
         file = Gio.file_new_for_path(filepath)
         try:
             info = file.query_info('standard::content-type',
                                    Gio.FileQueryInfoFlags.NONE, None)
             mime_type = (info.get_content_type() or "").lower()
-            ext = pathlib.Path(filepath).suffix.lower()
             is_video_mime = ("video" in mime_type) or (mime_type == "application/ogg")
-            if is_video_mime or ext in VIDEO_FILE_EXTENSIONS or _has_video_stream(filepath):
+            if is_video_mime or _has_video_stream(filepath):
                 file_list.append(filepath)
         except Exception:
-            if (
-                pathlib.Path(filepath).suffix.lower() in VIDEO_FILE_EXTENSIONS
-                or _has_video_stream(filepath)
-            ):
+            if _has_video_stream(filepath):
                 file_list.append(filepath)
     return sorted(file_list)
 
@@ -2357,25 +2374,25 @@ class ConfigUtil:
         return self._invalid()
 
     def save(self, config):
-        old_config = None
-        if os.path.isfile(CONFIG_PATH):
+        try:
             with open(CONFIG_PATH, "r") as f:
-                json_str = f.read()
-                try:
-                    old_config = json.loads(json_str)
-                    if not self._check(old_config):
-                        old_config = None
-                except json.decoder.JSONDecodeError:
-                    old_config = None
-        # Skip if the config is identical
-        if old_config == config:
-            return
+                if json.load(f) == config:
+                    return
+        except (OSError, json.JSONDecodeError):
+            pass
+        temp_path = None
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
-            with open(CONFIG_PATH, "w") as f:
-                json_str = json.dumps(config, indent=3)
-                print(json_str, file=f)
-                summary = _redacted_config_summary(config)
-                logger.debug(f"[Config] Saved {CONFIG_PATH} summary={summary}")
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CONFIG_DIR,
+                                             prefix=".config-", delete=False) as f:
+                temp_path = f.name
+                json.dump(config, f, indent=3)
+                f.write("\n")
+            os.replace(temp_path, CONFIG_PATH)
+            summary = _redacted_config_summary(config)
+            logger.debug(f"[Config] Saved {CONFIG_PATH} summary={summary}")
         except OSError as e:
             logger.warning(f"[Config] Could not save config to '{CONFIG_PATH}': {e}")
+        finally:
+            if temp_path is not None:
+                pathlib.Path(temp_path).unlink(missing_ok=True)

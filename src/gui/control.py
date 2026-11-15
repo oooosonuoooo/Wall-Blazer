@@ -2,6 +2,7 @@ import sys
 import subprocess
 import logging
 import threading
+import tempfile
 import os
 import shutil
 import mimetypes
@@ -24,10 +25,10 @@ try:
     from monitor import *
     from gui.gui_utils import debounce, request_thumbnail_pixbuf
     from utils import (
-        ConfigUtil, setup_autostart, is_gnome, is_wayland,
+        ConfigUtil, setup_autostart, is_autostart_enabled, is_gnome, is_wayland,
         get_video_paths, apply_gtk_theme, get_vlc_hwdec_profile,
         get_gpu_usage_snapshot, normalize_video_file, video_needs_normalization,
-        open_path_default,
+        open_path_default, probe_media_info, _ffmpeg_run_quiet,
     )
 except (ModuleNotFoundError, ImportError):
     from wallblazer.monitor import *
@@ -35,10 +36,10 @@ except (ModuleNotFoundError, ImportError):
     from wallblazer.ipc import get_service
     from wallblazer.gui.gui_utils import debounce, request_thumbnail_pixbuf
     from wallblazer.utils import (
-        ConfigUtil, setup_autostart, is_gnome, is_wayland,
+        ConfigUtil, setup_autostart, is_autostart_enabled, is_gnome, is_wayland,
         get_video_paths, apply_gtk_theme, get_vlc_hwdec_profile,
         get_gpu_usage_snapshot, normalize_video_file, video_needs_normalization,
-        open_path_default,
+        open_path_default, probe_media_info, _ffmpeg_run_quiet,
     )
 
 logging.basicConfig(level=logging.INFO)
@@ -340,7 +341,7 @@ class VideoGridTile(Gtk.FlowBoxChild):
         from concurrent.futures import ThreadPoolExecutor
         if cls._PREVIEW_EXECUTOR is None:
             cls._PREVIEW_EXECUTOR = ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="wb-preview"
+                max_workers=1, thread_name_prefix="wb-preview"
             )
         return cls._PREVIEW_EXECUTOR
 
@@ -350,6 +351,8 @@ class VideoGridTile(Gtk.FlowBoxChild):
         self._thumb_width = width
         self._thumb_height = height
         self._thumb_requested = False
+        self._thumb_future = None
+        self._thumb_visible = False
         self._disposed = False
         self._static_pixbuf = None
 
@@ -357,8 +360,8 @@ class VideoGridTile(Gtk.FlowBoxChild):
         self._preview_frames = []   # list of GdkPixbuf
         self._preview_timer_id = None
         self._preview_frame_idx = 0
-        self._preview_loaded = False
-        self._preview_loading = False
+        self._preview_delay_id = None
+        self._preview_cancel_event = None
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         root.set_margin_top(6)
@@ -396,124 +399,103 @@ class VideoGridTile(Gtk.FlowBoxChild):
 
     # ── Static thumbnail ──────────────────────────────
     def _on_thumbnail_ready(self, pixbuf):
-        if self._disposed:
-            return False
-        self._static_pixbuf = pixbuf
-        if pixbuf is None:
-            self.thumb_image.set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
-            return False
-        try:
-            self.thumb_image.set_from_pixbuf(pixbuf)
-        except Exception as e:
-            logger.debug(f"[VideoTile] Failed to apply thumbnail for {self.video_path}: {e}")
-            self.thumb_image.set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
+        self._thumb_future = None
+        if self._disposed or not self._thumb_visible:
+            self._thumb_requested = False
+        elif pixbuf is not None:
+            self._static_pixbuf = pixbuf
+            if self._preview_timer_id is None:
+                self.thumb_image.set_from_pixbuf(pixbuf)
         return False
 
-    def start(self):
-        if self._disposed or self._thumb_requested:
-            return False
-        self._thumb_requested = True
-        request_thumbnail_pixbuf(
-            self.video_path,
-            width=self._thumb_width,
-            height=self._thumb_height,
-            on_ready=self._on_thumbnail_ready,
-        )
-        return True
+    def set_thumbnail_visible(self, visible):
+        if visible == self._thumb_visible:
+            return
+        self._thumb_visible = visible
+        if visible:
+            if not self._thumb_requested:
+                self._thumb_requested = True
+                self._thumb_future = request_thumbnail_pixbuf(
+                    self.video_path, self._thumb_width, self._thumb_height,
+                    self._on_thumbnail_ready,
+                )
+            return
+
+        if self._thumb_future is not None and self._thumb_future.cancel():
+            self._thumb_future = None
+        if self._thumb_future is None:
+            self._thumb_requested = False
+        self._static_pixbuf = None
+        self.stop()
 
     def stop(self):
+        if self._preview_delay_id is not None:
+            GLib.source_remove(self._preview_delay_id)
+            self._preview_delay_id = None
+        if self._preview_cancel_event is not None:
+            self._preview_cancel_event.set()
+            self._preview_cancel_event = None
         self._stop_preview_animation()
+        self._preview_frames = []
+        if self._static_pixbuf is not None:
+            self.thumb_image.set_from_pixbuf(self._static_pixbuf)
+        else:
+            self.thumb_image.set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
 
-    # ── Hover animated preview ────────────────────────
-    def _on_hover_enter(self, _widget, _event):
-        if self._disposed:
-            return False
-        if self._preview_loaded and self._preview_frames:
-            self._start_preview_animation()
-        elif not self._preview_loading:
-            self._preview_loading = True
-            self._get_preview_executor().submit(self._load_preview_frames_bg)
+    def _on_hover_enter(self, _widget, event):
+        if event.detail != Gdk.NotifyType.INFERIOR and self._preview_delay_id is None:
+            self._preview_delay_id = GLib.timeout_add(400, self._start_hover_preview)
         return False
 
-    def _on_hover_leave(self, _widget, _event):
-        if self._disposed:
-            return False
-        self._stop_preview_animation()
-        # Restore static thumbnail
-        if not self._disposed:
-            try:
-                if self._static_pixbuf is not None:
-                    self.thumb_image.set_from_pixbuf(self._static_pixbuf)
-                else:
-                    self.thumb_image.set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
-            except Exception:
-                pass
+    def _on_hover_leave(self, _widget, event):
+        if event.detail != Gdk.NotifyType.INFERIOR:
+            self.stop()
         return False
 
-    def _load_preview_frames_bg(self):
-        """Extract N evenly-spaced frames from the video in a background thread."""
-        if self._disposed:
+    def _start_hover_preview(self):
+        self._preview_delay_id = None
+        if self._thumb_visible and self._preview_cancel_event is None:
+            cancel = threading.Event()
+            self._preview_cancel_event = cancel
+            self._get_preview_executor().submit(self._load_preview_frames_bg, cancel)
+        return False
+
+    def _load_preview_frames_bg(self, cancel):
+        """Decode a few small frames while the pointer stays on this tile."""
+        if cancel.is_set():
             return
         frames = []
         try:
-            import subprocess as _sp
-            # Get duration
-            try:
-                out = _sp.check_output(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", self.video_path],
-                    timeout=8, text=True, stderr=_sp.DEVNULL
-                ).strip()
-                duration = float(out)
-            except Exception:
-                duration = 10.0
+            from gi.repository import GdkPixbuf
 
-            n = self._PREVIEW_FRAMES
-            for i in range(n):
-                if self._disposed:
-                    break
-                # Spread frames across 10%–90% of the video
-                seek = duration * (0.1 + 0.8 * i / max(n - 1, 1))
-                import tempfile
-                import os as _os
-                tmp = tempfile.NamedTemporaryFile(
-                    suffix=".jpg", delete=False, prefix="wb-prev-"
-                )
-                tmp.close()
-                tmp_path = tmp.name
-                ret = _sp.run(
-                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                     "-ss", f"{seek:.3f}", "-i", self.video_path,
-                     "-frames:v", "1", "-an",
-                     "-vf", f"scale={self._thumb_width}:{self._thumb_height}:force_original_aspect_ratio=decrease,pad={self._thumb_width}:{self._thumb_height}:(ow-iw)/2:(oh-ih)/2",
-                     tmp_path],
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10
-                )
-                if ret.returncode == 0 and _os.path.exists(tmp_path) and _os.path.getsize(tmp_path) > 0:
-                    try:
-                        from gi.repository import GdkPixbuf
-                        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(
-                            tmp_path, self._thumb_width, self._thumb_height
-                        )
-                        frames.append(pb)
-                    except Exception:
-                        pass
-                try:
-                    _os.remove(tmp_path)
-                except Exception:
-                    pass
+            duration = probe_media_info(self.video_path).get("duration") or 10.0
+            width, height = self._thumb_width, self._thumb_height
+            filters = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            )
+            with tempfile.TemporaryDirectory(prefix="wb-preview-") as directory:
+                frame_path = os.path.join(directory, "frame.jpg")
+                for i in range(self._PREVIEW_FRAMES):
+                    if cancel.is_set():
+                        return
+                    seek = duration * (0.1 + 0.8 * i / (self._PREVIEW_FRAMES - 1))
+                    result = _ffmpeg_run_quiet(
+                        ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                         "-filter_threads", "1", "-threads:v", "1",
+                         "-ss", f"{seek:.3f}", "-i", self.video_path,
+                         "-frames:v", "1", "-an", "-vf", filters, "-threads:v", "1", frame_path],
+                        timeout=8, cancel_event=cancel,
+                    )
+                    if result.returncode == 0 and os.path.isfile(frame_path):
+                        frames.append(GdkPixbuf.Pixbuf.new_from_file(frame_path))
+                        os.unlink(frame_path)
         except Exception as e:
-            logger.debug(f"[VideoTile] Preview frame extraction failed for {self.video_path}: {e}")
+            logger.debug(f"[VideoTile] Preview extraction failed for {self.video_path}: {e}")
 
         def _on_frames_ready():
-            if self._disposed:
-                return False
-            self._preview_loading = False
-            if frames:
+            if not cancel.is_set() and frames:
                 self._preview_frames = frames
-                self._preview_loaded = True
-                # Start animation immediately if still hovered
-                self._preview_frame_idx = 0
                 self._start_preview_animation()
             return False
 
@@ -548,18 +530,11 @@ class VideoGridTile(Gtk.FlowBoxChild):
         return True  # keep timer running
 
     def cleanup(self):
-        # Set disposed flag first so any in-flight GLib.idle_add callbacks
-        # from _load_preview_frames_bg bail out before touching widgets (Bug 7).
         self._disposed = True
-        self._stop_preview_animation()
-        self._preview_frames = []
-        self._static_pixbuf = None
+        self.set_thumbnail_visible(False)
 
 
 class ControlPanel(Gtk.Application):
-    _THUMBNAIL_WARMUP_MAX = 96
-    _THUMBNAIL_WARMUP_INTERVAL_MS = 120
-
     def __init__(self, version, *args, **kwargs):
         super().__init__(
             *args,
@@ -606,6 +581,7 @@ class ControlPanel(Gtk.Application):
         self._icon_view_key_handler_id = None
         self._gpu_profile = None
         self._gpu_status_timer_id = None
+        self._gpu_status_pending = False
         self._video_search_query = ""
         self._file_manager_mode = True
         self._fm_clipboard_mode = None  # "copy" | "cut" | None
@@ -619,14 +595,14 @@ class ControlPanel(Gtk.Application):
 
         # Local-video grid playback
         self._video_tiles = {}
-        self._video_grid_warmup_source_id = None
+        self._video_grid_update_id = None
         # Per-monitor playlist tab state
         self._playlist_selected_monitor = None   # currently selected monitor name in ListBox
         self._playlist_store = None              # GtkListStore for TreeViewPlaylist
         self._playlist_combo_handler_id = None   # signal ID for playlist combobox
         self._monitor_listbox_handler_id = None  # signal ID for monitor ListBox row-selected (Bug 2)
 
-        self.is_autostart = os.path.isfile(AUTOSTART_DESKTOP_PATH)
+        self.is_autostart = is_autostart_enabled()
         self._connect_server()
         self._load_config()
         self._file_manager_mode = bool(self.config.get("file_manager_mode", True))
@@ -970,7 +946,7 @@ class ControlPanel(Gtk.Application):
         if self._gpu_status_timer_id is not None:
             return
         self._update_gpu_status_label()
-        self._gpu_status_timer_id = GLib.timeout_add_seconds(3, self._update_gpu_status_label)
+        self._gpu_status_timer_id = GLib.timeout_add_seconds(10, self._update_gpu_status_label)
 
     def _format_gpu_usage(self, snapshot):
         if not snapshot:
@@ -993,8 +969,9 @@ class ControlPanel(Gtk.Application):
         # Opt 3: run the external tool calls (nvidia-smi, lspci, glxinfo) off the GTK
         # main thread so they cannot stall UI rendering by 1-4 seconds.
         label: Gtk.Label = self.builder.get_object("LabelGpuStatus")
-        if label is None:
+        if label is None or self._gpu_status_pending:
             return True
+        self._gpu_status_pending = True
 
         def _worker():
             try:
@@ -1010,6 +987,7 @@ class ControlPanel(Gtk.Application):
                 text = f"GPU status unavailable: {e}"
 
             def _update():
+                self._gpu_status_pending = False
                 try:
                     lbl = self.builder.get_object("LabelGpuStatus")
                     if lbl is not None:
@@ -1025,8 +1003,7 @@ class ControlPanel(Gtk.Application):
 
     def _on_stack_visible_child_changed(self, stack, _param):
         if stack.get_visible_child_name() == "video":
-            self._start_video_grid_playback()
-            self._schedule_video_grid_warmup()
+            self._schedule_video_grid_update()
         else:
             self._stop_video_grid_playback()
 
@@ -1034,72 +1011,48 @@ class ControlPanel(Gtk.Application):
         stack: Gtk.Stack = self.builder.get_object("stack1")
         return stack is not None and stack.get_visible_child_name() == "video"
 
-    def _schedule_video_grid_warmup(self):
-        if self._video_grid_warmup_source_id is not None:
-            return
-        self._video_grid_warmup_source_id = GLib.timeout_add(
-            self._THUMBNAIL_WARMUP_INTERVAL_MS,
-            self._start_video_grid_playback_once,
-        )
+    def _schedule_video_grid_update(self, *_args):
+        if self._video_grid_update_id is None and self._is_video_tab_visible():
+            self._video_grid_update_id = GLib.idle_add(self._update_visible_thumbnails)
 
-    def _start_video_grid_playback_once(self):
-        if not self._is_video_tab_visible():
-            self._video_grid_warmup_source_id = None
+    def _update_visible_thumbnails(self):
+        self._video_grid_update_id = None
+        if not self._is_video_tab_visible() or not self.icon_view.get_mapped():
             return False
-        has_pending = self._start_video_grid_playback()
-        if not has_pending:
-            self._video_grid_warmup_source_id = None
-        return has_pending
+
+        scroller = self.builder.get_object("VideoGridScroller")
+        adjustment = scroller.get_vadjustment()
+        top = adjustment.get_value()
+        bottom = top + adjustment.get_page_size()
+        visible_tiles = []
+        for tile in self._video_tiles.values():
+            coords = tile.translate_coordinates(self.icon_view, 0, 0)
+            if coords is not None:
+                y = coords[1] + self.icon_view.get_margin_top()
+                if y < bottom and y + tile.get_allocated_height() > top:
+                    visible_tiles.append(tile)
+                    continue
+            tile.set_thumbnail_visible(False)
+        for tile in visible_tiles:
+            tile.set_thumbnail_visible(True)
+        return False
 
     def _clear_video_grid(self):
-        if self._video_grid_warmup_source_id is not None:
-            try:
-                GLib.source_remove(self._video_grid_warmup_source_id)
-            except Exception:
-                pass
-            self._video_grid_warmup_source_id = None
-
+        self._stop_video_grid_playback()
         for tile in self._video_tiles.values():
-            cleanup = getattr(tile, "cleanup", None)
-            if callable(cleanup):
-                try:
-                    cleanup()
-                except Exception:
-                    pass
+            tile.cleanup()
         self._video_tiles.clear()
 
         if self.icon_view is not None:
-            for child in list(self.icon_view.get_children()):
-                try:
-                    self.icon_view.remove(child)
-                except Exception:
-                    pass
-
-    def _start_video_grid_playback(self):
-        started = 0
-        has_pending = False
-        for tile in self._video_tiles.values():
-            if getattr(tile, "_thumb_requested", False):
-                continue
-            has_pending = True
-            if started >= self._THUMBNAIL_WARMUP_MAX:
-                break
-            start = getattr(tile, "start", None)
-            if callable(start) and start():
-                started += 1
-        return has_pending
+            for child in self.icon_view.get_children():
+                self.icon_view.remove(child)
 
     def _stop_video_grid_playback(self):
-        if self._video_grid_warmup_source_id is not None:
-            try:
-                GLib.source_remove(self._video_grid_warmup_source_id)
-            except Exception:
-                pass
-            self._video_grid_warmup_source_id = None
+        if self._video_grid_update_id is not None:
+            GLib.source_remove(self._video_grid_update_id)
+            self._video_grid_update_id = None
         for tile in self._video_tiles.values():
-            stop = getattr(tile, "stop", None)
-            if callable(stop):
-                stop()
+            tile.set_thumbnail_visible(False)
 
     def _release_video_grid_instance(self):
         self._clear_video_grid()
@@ -1321,6 +1274,14 @@ class ControlPanel(Gtk.Application):
             self._refresh_playlist_treeview(self._playlist_selected_monitor)
 
         self._reload_icon_view()
+        if self.icon_view is not None:
+            self.icon_view.connect("map", self._schedule_video_grid_update)
+            self.icon_view.connect("size-allocate", self._schedule_video_grid_update)
+            scroller = self.builder.get_object("VideoGridScroller")
+            if scroller is not None:
+                adjustment = scroller.get_vadjustment()
+                adjustment.connect("value-changed", self._schedule_video_grid_update)
+                adjustment.connect("changed", self._schedule_video_grid_update)
         self._start_gpu_status_updates()
         stack: Gtk.Stack = self.builder.get_object("stack1")
         if stack is not None:
@@ -2150,11 +2111,7 @@ class ControlPanel(Gtk.Application):
             self._sync_icon_view_selection_to_monitor_playlist()
 
         self._on_icon_view_selection_changed(self.icon_view)
-        if self._is_video_tab_visible():
-            self._start_video_grid_playback()
-            self._schedule_video_grid_warmup()
-        else:
-            self._stop_video_grid_playback()
+        self._schedule_video_grid_update()
 
     def _get_selected_video_paths(self):
         if self.icon_view is None or not self.video_paths:

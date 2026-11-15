@@ -3,10 +3,22 @@
 set -euo pipefail
 
 MODE="install"
+ENABLE_AUTOSTART=false
+INSTALL_DEPENDENCIES=true
 for arg in "$@"; do
   case "$arg" in
     --repair)
       MODE="repair"
+      ;;
+    --enable-autostart)
+      ENABLE_AUTOSTART=true
+      ;;
+    --skip-dependencies)
+      INSTALL_DEPENDENCIES=false
+      ;;
+    *)
+      echo "Usage: $0 [--repair] [--enable-autostart] [--skip-dependencies]" >&2
+      exit 2
       ;;
   esac
 done
@@ -160,7 +172,7 @@ build_and_install() {
   rm -rf "$BUILD_DIR"
 
   echo ">> Building Wall Blazer with Meson..."
-  meson setup "$BUILD_DIR" --prefix=/usr
+  meson setup "$BUILD_DIR" --prefix=/usr/local
 
   echo ">> Compiling..."
   ninja -C "$BUILD_DIR"
@@ -200,46 +212,19 @@ EOF
   rm -f "$tmp_runner"
 }
 
-configure_auto_repair_timer() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo ">> systemctl not found; skipping auto-repair timer setup."
+remove_legacy_repair_timer() {
+  if [[ ! -f "$AUTOREPAIR_TIMER" && ! -f "$AUTOREPAIR_SERVICE" ]]; then
     return
   fi
 
-  echo ">> Enabling user-level auto-repair timer..."
-  mkdir -p "$AUTOREPAIR_SERVICE_DIR"
-
-  cat > "$AUTOREPAIR_SERVICE" <<'EOF'
-[Unit]
-Description=Wall Blazer Runtime Auto-Repair
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -lc 'command -v wallblazer >/dev/null 2>&1 && wallblazer --repair || true'
-EOF
-
-  cat > "$AUTOREPAIR_TIMER" <<'EOF'
-[Unit]
-Description=Run Wall Blazer auto-repair every 30 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=30min
-Persistent=true
-Unit=wallblazer-autorepair.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  if systemctl --user daemon-reload \
-    && systemctl --user enable --now wallblazer-autorepair.timer; then
-    echo ">> Auto-repair timer enabled."
-  else
-    echo ">> Could not enable user systemd timer automatically."
-    echo "   You can enable it manually with:"
-    echo "   systemctl --user daemon-reload"
-    echo "   systemctl --user enable --now wallblazer-autorepair.timer"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now wallblazer-autorepair.timer 2>/dev/null || true
+    systemctl --user stop wallblazer-autorepair.service 2>/dev/null || true
+  fi
+  rm -f "$AUTOREPAIR_SERVICE" "$AUTOREPAIR_TIMER" \
+    "$AUTOREPAIR_SERVICE_DIR/timers.target.wants/wallblazer-autorepair.timer"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload 2>/dev/null || true
   fi
 }
 
@@ -249,15 +234,18 @@ if [[ "$MODE" != "repair" ]]; then
   backup_if_exists "$HOME/.local/share/wallblazer"
 fi
 
-install_system_dependencies
+if "$INSTALL_DEPENDENCIES"; then
+  install_system_dependencies
+fi
 verify_python_dependencies
 build_and_install
 install_repair_runner
-configure_auto_repair_timer
+remove_legacy_repair_timer
 
-if command -v wallblazer >/dev/null 2>&1; then
-  echo ">> Running runtime repair verification..."
-  wallblazer --repair || true
+echo ">> Running runtime repair verification..."
+/usr/local/bin/wallblazer --repair
+if "$ENABLE_AUTOSTART"; then
+  /usr/local/bin/wallblazer --enable-autostart
 fi
 
 echo ">> Setup finished successfully!"

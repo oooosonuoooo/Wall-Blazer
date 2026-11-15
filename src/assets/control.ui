@@ -501,7 +501,7 @@ Videos in the Wall Blazer folder</property>
             </child>
             <!-- Icon view -->
             <child>
-              <object class="GtkScrolledWindow">
+              <object class="GtkScrolledWindow" id="VideoGridScroller">
                 <property name="visible">True</property>
                 <property name="can-focus">True</property>
                 <property name="shadow-type">in</property>

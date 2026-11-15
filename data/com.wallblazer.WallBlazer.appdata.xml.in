@@ -27,6 +27,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="3.7.1" date="2026-11-15" type="stable">
+      <description>
+        <ul>
+          <li>Restore wallpaper-only login startup and show the actual autostart setting.</li>
+          <li>Load video thumbnails as they enter view and stop preview work when leaving the tile.</li>
+          <li>Keep scaled compatibility frames in GPU memory through H.264 encoding.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.7" date="2026-10-13" type="stable">
       <description>
         <ul>

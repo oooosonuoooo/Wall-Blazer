@@ -262,6 +262,7 @@ def _new_gpu_sink_and_widget(width, height):
         widget = _new_native_gl_widget(sink, width, height) if sink is not None else None
         if sink is not None and widget is not None:
             _disable_sink_aspect_ratio(sink)
+            sink.set_property("enable-last-sample", False)
             return sink, widget, True
 
     sink = Gst.ElementFactory.make("gtkglsink", None)
@@ -274,6 +275,7 @@ def _new_gpu_sink_and_widget(width, height):
     if widget is None:
         return None, None, False
     _disable_sink_aspect_ratio(sink)
+    sink.set_property("enable-last-sample", False)
     widget.set_hexpand(True)
     widget.set_vexpand(True)
     widget.set_size_request(width, height)

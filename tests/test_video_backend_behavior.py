@@ -72,7 +72,10 @@ class PreloadTransitionTests(unittest.TestCase):
 
     def test_gstreamer_queue_media_accepts_audio_policy(self):
         media = SimpleNamespace(disable_audio=False)
-        window = SimpleNamespace()
+        window = SimpleNamespace(
+            _cancel_queued_gpu_preparation=Mock(),
+            _queued_prepare_generation=0,
+        )
 
         gst_video_player.GstPlayerWindow.queue_media(
             window,
@@ -219,6 +222,7 @@ class BackendSelectionTests(unittest.TestCase):
             width=1920,
             height=1080,
             _fit_mode="cover",
+            _gpu_native_sink=False,
             _last_dimensions=(None, None),
             _video_widget=video_widget,
             _viewport=viewport,
@@ -312,6 +316,7 @@ class BackendSelectionTests(unittest.TestCase):
         player = SimpleNamespace(
             mode=server.MODE_VIDEO,
             _find_monitor_window=lambda name: (monitor, window),
+            _startup_playback_is_pending=lambda *args: False,
             _reverse_state={},
             _get_source_for_monitor=lambda name, sources: "/tmp/current.mp4",
             config={server.CONFIG_KEY_DATA_SOURCE: {"Default": "/tmp/current.mp4"}},
@@ -366,6 +371,9 @@ class GpuPlaybackCacheTests(unittest.TestCase):
             self.assertEqual(prepared_source, result["output_path"])
             command = run.call_args.args[0]
             self.assertEqual(command[command.index("-c:v") + 1], "h264_nvenc")
+            filters = command[command.index("-vf") + 1]
+            self.assertIn("hwupload_cuda,scale_cuda", filters)
+            self.assertNotIn("hwdownload", filters)
 
     def test_gst_media_keeps_original_identity_but_uses_cached_source(self):
         with patch.object(
@@ -409,6 +417,35 @@ class GpuPlaybackCacheTests(unittest.TestCase):
             sources = app._configured_video_sources_for_gpu()
 
         self.assertEqual(set(sources), {str(path) for path in paths[:2]})
+
+
+class AutostartTests(unittest.TestCase):
+    def test_reenabling_hidden_entry_creates_background_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_path = Path(directory) / "wallblazer.desktop"
+            entry_path.write_text("[Desktop Entry]\nName=Wall Blazer\nExec=wallblazer -b\nHidden=true\n")
+            with (
+                patch.object(utils, "AUTOSTART_DIR", directory),
+                patch.object(utils, "AUTOSTART_DESKTOP_PATH", str(entry_path)),
+                patch.dict(os.environ, {"WALLBLAZER_LAUNCHER": "/usr/local/bin/wallblazer"}),
+                patch.object(utils, "is_flatpak", return_value=False),
+            ):
+                self.assertFalse(utils.is_autostart_enabled())
+                utils.setup_autostart(True)
+                self.assertTrue(utils.is_autostart_enabled())
+                self.assertIn('Exec="/usr/local/bin/wallblazer" -b', entry_path.read_text())
+                utils.setup_autostart(False)
+                self.assertFalse(utils.is_autostart_enabled())
+
+    def test_background_launch_leaves_running_wallpaper_and_gui_alone(self):
+        existing = Mock()
+        with (
+            patch.object(server, "get_instance", return_value=existing),
+            patch.object(server, "WallBlazerServer") as new_server,
+        ):
+            server.main("test", "", "", SimpleNamespace(p=0, background=True))
+        existing.show_gui.assert_not_called()
+        new_server.assert_not_called()
 
 
 if __name__ == "__main__":

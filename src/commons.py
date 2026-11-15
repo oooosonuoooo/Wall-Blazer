@@ -38,7 +38,7 @@ Icon=com.wallblazer.WallBlazer
 Terminal=false
 Type=Application
 Categories=GTK;Utility;
-StartupNotify=true
+StartupNotify=false
 """
 AUTOSTART_DESKTOP_CONTENT_FLATPAK = """[Desktop Entry]
 Name=Wall Blazer

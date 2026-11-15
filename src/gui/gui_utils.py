@@ -48,10 +48,9 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, value))
 
 
-_CPU_COUNT = os.cpu_count() or 4
 THUMBNAIL_WORKERS = _env_int(
     "WALLBLAZER_THUMBNAIL_WORKERS",
-    default=min(8, max(4, _CPU_COUNT + 2)),
+    default=1,
     min_value=1,
     max_value=16,
 )
@@ -68,7 +67,6 @@ THUMBNAIL_SIZE = _env_int(
     max_value=1024,
 )
 
-# Keep generation bounded, but use enough workers that large video folders warm quickly.
 THUMBNAIL_SEMAPHORE = threading.Semaphore(THUMBNAIL_WORKERS)
 THUMBNAIL_EXECUTOR = ThreadPoolExecutor(
     max_workers=THUMBNAIL_WORKERS,
@@ -98,6 +96,9 @@ def _tmp_thumb_path(thumb: str) -> str:
 def _run_thumbnail_command(cmd: list[str], thumb: str) -> bool:
     tmp_thumb = _tmp_thumb_path(thumb)
     run_cmd = [tmp_thumb if arg == "{output}" else arg for arg in cmd]
+    nice = shutil.which("nice") if sys.platform != "win32" else None
+    if nice:
+        run_cmd = [nice, "-n", "19", *run_cmd]
     try:
         ret = subprocess.run(
             run_cmd,
@@ -136,12 +137,15 @@ def _generate_with_ffmpegthumbnailer(filename: str, thumb: str) -> bool:
 
 
 def _ffmpeg_thumbnail_commands(filename: str):
-    common = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    common = [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+        "-filter_threads", "1", "-threads:v", "1",
+    ]
     filters = f"scale={THUMBNAIL_SIZE}:-1:flags=fast_bilinear"
+    output = ["-frames:v", "1", "-an", "-vf", filters, "-threads:v", "1", "{output}"]
     return [
-        common + ["-ss", "1", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
-        common + ["-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
-        common + ["-ss", "0", "-i", filename, "-frames:v", "1", "-an", "-vf", filters, "{output}"],
+        common + ["-ss", "1", "-i", filename] + output,
+        common + ["-i", filename] + output,
     ]
 
 
@@ -165,9 +169,9 @@ def generate_thumbnail(filename: str) -> str | None:
         return thumb
 
     try:
-        if _generate_with_ffmpegthumbnailer(filename, thumb):
-            return thumb
         if _generate_with_ffmpeg(filename, thumb):
+            return thumb
+        if _generate_with_ffmpegthumbnailer(filename, thumb):
             return thumb
     except OSError as e:
         logger.debug(f"[Thumbnail] failed for {filename}: {e}")
@@ -231,7 +235,7 @@ def request_thumbnail_pixbuf(video_path: str, width: int, height: int, on_ready)
 
         GLib.idle_add(_dispatch)
 
-    THUMBNAIL_EXECUTOR.submit(_job)
+    return THUMBNAIL_EXECUTOR.submit(_job)
 
 
 def debounce(wait_time):

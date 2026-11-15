@@ -379,12 +379,11 @@ class WallBlazerServer(object):
         self._pending_gpu_setup = None
         self._gpu_prepare_failed_generation = None
 
-        # Player process
+    def _start(self):
         self.reload()
         self._player_watchdog_id = GLib.timeout_add_seconds(6, self._player_watchdog_tick)
 
-        # Show main GUI
-        if not args.background:
+        if not self.args.background:
             self.show_gui()
 
         logger.info("[Server] Started")
@@ -1546,8 +1545,13 @@ def _kill_stale_servers():
 
 
 def main(version, pkgdatadir, localedir, args):
+    if args.p > 0:
+        time.sleep(args.p)
+
     existing = get_instance(DBUS_NAME_SERVER)
     if existing is not None:
+        if args.background:
+            return
         # Try to tell the running server to pop up its GUI window
         try:
             ok = _call_with_timeout(lambda: existing.show_gui(), timeout_sec=2.0)
@@ -1560,16 +1564,18 @@ def main(version, pkgdatadir, localedir, args):
             # The existing server is stale/broken — kill it and start fresh
             logger.warning("[Server] Existing server is unresponsive, restarting...")
             _kill_stale_servers()
-    elif args.background:
-        # In background mode, avoid orphan stacks from stale previous sessions.
-        _kill_stale_servers()
-
-    # Pause before launching (used for autostart delay)
-    time.sleep(args.p)
-
     server = WallBlazerServer(version, pkgdatadir, localedir, args)
     try:
         service_handle = publish_service(DBUS_NAME_SERVER, server)
-        loop.run()
     except Exception:
-        raise Exception("[Server] Failed to publish IPC service – another instance may be running.")
+        if get_instance(DBUS_NAME_SERVER) is None:
+            raise
+        return
+    try:
+        server._start()
+        loop.run()
+    finally:
+        if hasattr(service_handle, "unpublish"):
+            service_handle.unpublish()
+        else:
+            service_handle.close()

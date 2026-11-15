@@ -158,7 +158,14 @@ def publish_service(name, obj):
             bus = _DBusSessionBus()
             return bus.publish(name, obj)
         except Exception:
-            pass
+            # A second launch must not fall back to XML-RPC when D-Bus
+            # already has an owner for this service name.
+            try:
+                bus_owner = _DBusSessionBus().get(".DBus").NameHasOwner(name)
+            except Exception:
+                bus_owner = False
+            if bus_owner:
+                raise
     return LocalServiceHandle(name, obj)
 
 

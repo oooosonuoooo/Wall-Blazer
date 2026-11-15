@@ -63,8 +63,8 @@
   <li><strong>Seamless Playlist Switching:</strong> Preloads the next video in the background and switches ~0.5 seconds early to eliminate flickering and ensure instant transitions.</li>
   <li><strong>Custom Playlists:</strong> Create multiple named playlists, assign them to specific monitors, and customize intervals and shuffle modes.</li>
   <li><strong>Per-Mode Playback Speed:</strong> Tune single wallpaper speed, playlist forward speed, and reverse speed independently from <code>0.25x</code> to <code>4x</code>.</li>
-  <li><strong>GPU-First Playback:</strong> On NVIDIA X11, automatically selects the validated GStreamer CUDA/NVDEC plus GL path for supported H.264/HEVC/VP9 video, avoiding unstable VLC surface negotiation. Unsupported local codecs (such as AV1 on GPUs without AV1 decoding) are prepared once in the background as cached 1080p H.264, using NVENC when available; originals stay untouched and subsequent playback uses NVDEC. Set <code>WALLBLAZER_GPU_COMPAT_PREPARE=0</code> to skip preparation or <code>WALLBLAZER_FORCE_HWDEC=none</code> to opt out of the GPU path.</li>
-  <li><strong>Broad Video Preview:</strong> Employs multiple extraction strategies to generate previews even for difficult codecs and containers.</li>
+  <li><strong>GPU-First Playback:</strong> On NVIDIA X11, automatically selects the validated GStreamer CUDA/NVDEC plus GL path for supported H.264/HEVC/VP9 video, avoiding unstable VLC surface negotiation. Unsupported local codecs (such as AV1 on GPUs without AV1 decoding) are prepared once in the background as cached H.264 up to 1080p, with CUDA scaling and direct NVENC input; originals stay untouched and subsequent playback uses NVDEC. Set <code>WALLBLAZER_GPU_COMPAT_PREPARE=0</code> to skip preparation or <code>WALLBLAZER_FORCE_HWDEC=none</code> to opt out of the GPU path.</li>
+  <li><strong>Broad Video Preview:</strong> Loads cached thumbnails and generates missing ones for visible tiles. Hover previews start after a short delay and stop when the pointer leaves the tile.</li>
 </ul>
 
 <h3>⚙️ System Integration & Resource Management</h3>
@@ -75,9 +75,9 @@
   <li><strong>Higher-Quality Reverse Cache:</strong> Reverse playback keeps the original frame cadence and uses a higher-quality encode path instead of aggressively downscaling the cached reverse video.</li>
   <li><strong>Smart Pause & Mute:</strong> Automatically pauses or mutes playback when a window is maximized or goes fullscreen to conserve system resources.</li>
   <li><strong>Native Desktop Integration:</strong> Built for GNOME, Cinnamon, and other GTK-based desktops. Supports native X11 and Wayland (with Wayland-specific window detection limits).</li>
-  <li><strong>Auto-Start & Tray Icon:</strong> Automatically launches on boot via system portal/<code>.desktop</code> entry and runs quietly in the system tray.</li>
+  <li><strong>Auto-Start & Tray Icon:</strong> Restores the configured wallpaper at graphical login when Autostart is enabled. Open the control panel from the app menu or tray icon.</li>
   <li><strong>GTK Theme Sync:</strong> Automatically adapts to your system's Light, Dark, or System theme.</li>
-  <li><strong>Self-Healing & Auto-Repair:</strong> Features runtime health checks, a player watchdog for auto-restarts, and an installer-provisioned repair command and timer.</li>
+  <li><strong>Self-Healing & Auto-Repair:</strong> Features runtime health checks, a player watchdog for auto-restarts, and a manual repair command.</li>
 </ul>
 
 <h3>🚀 Performance Optimization Scripts</h3>
@@ -104,7 +104,9 @@
 <pre><code class="language-bash">git clone https://github.com/oooosonuoooo/Wall-Blazer.git
 cd Wall-Blazer
 chmod +x install.sh
-./install.sh</code></pre>
+./install.sh --enable-autostart</code></pre>
+
+<p>Omit <code>--enable-autostart</code> to keep your existing login preference. To reinstall with your current dependencies, use <code>./install.sh --repair --skip-dependencies</code>.</p>
 
 <h3>3. Windows Installation (Automated)</h3>
 <p>Wall Blazer now supports native Windows with an automated <strong>MSYS2/UCRT64 + GTK</strong> build path and bundled GTK/VLC runtime files.</p>
