@@ -377,6 +377,7 @@ class WallBlazerServer(object):
         self._gpu_prepare_thread = None
         self._gpu_prepare_cancel_event = None
         self._pending_gpu_setup = None
+        self._gpu_prepare_failed_generation = None
 
         # Player process
         self.reload()
@@ -703,6 +704,7 @@ class WallBlazerServer(object):
 
         self._pending_gpu_setup = None
         if not prepared:
+            self._gpu_prepare_failed_generation = generation
             logger.warning(
                 "[GPU cache] Playback was not started because a GPU-compatible source could not be prepared"
             )
@@ -719,6 +721,8 @@ class WallBlazerServer(object):
             self, "_gpu_prepare_generation", 0
         ) + 1
         generation = self._gpu_prepare_generation
+        if not _gpu_prepared:
+            self._gpu_prepare_failed_generation = None
 
         # Set data source if specified
         if data_source is not None and monitor:
@@ -853,6 +857,18 @@ class WallBlazerServer(object):
         Keeps running as long as server main loop is alive.
         """
         if self.mode == MODE_NULL:
+            return True
+
+        # GPU compatibility preparation intentionally delays launching the
+        # player. Do not treat that pending state as a crashed player or the
+        # watchdog will cancel the conversion on every retry.
+        if getattr(self, "_pending_gpu_setup", None) is not None:
+            return True
+        failed_generation = getattr(self, "_gpu_prepare_failed_generation", None)
+        if (
+            failed_generation is not None
+            and failed_generation == getattr(self, "_gpu_prepare_generation", None)
+        ):
             return True
 
         proc = self.player_process
