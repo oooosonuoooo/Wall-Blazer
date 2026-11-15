@@ -5,6 +5,8 @@ import os
 import pathlib
 import sys
 import threading
+import time
+from dataclasses import dataclass
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -70,6 +72,17 @@ _X11_LIBRARY = None
 _X11_DISPLAY = None
 
 
+@dataclass
+class _Preroll:
+    player: Gst.Element
+    sink: Gst.Element
+    widget: Gtk.Widget
+    video_filter: Gst.Bin
+    balance: Gst.Element
+    decoder: str
+    deadline: float
+
+
 def _gpu_max_fps():
     """Balance smooth motion and low presentation overhead on the GPU path."""
     try:
@@ -97,10 +110,10 @@ def _set_native_gl_window(sink, widget):
         return False
     try:
         window = widget.get_window()
-        if window is None:
+        if window is None or not window.ensure_native():
             return False
-        window.ensure_native()
         xid = GdkX11.X11Window.get_xid(window)
+        widget.get_display().sync()
         GstVideo.VideoOverlay.set_window_handle(sink, xid)
         _disable_sink_aspect_ratio(sink)
         _update_native_gl_render_rectangle(sink, widget)
@@ -606,6 +619,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self.width = max(1, int(width))
         self.height = max(1, int(height))
         self.name = name
+        self.set_title("WallBlazer Wallpaper")
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
 
         self._using_gpu_filters = False
         self._gpu_filter = None
@@ -696,6 +712,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_base = None
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
+        self._queued_preroll = None
+        self._preroll_failed = False
         self._direct_switch_pending = False
         self._queued_preparing = False
         self._queued_prepare_generation = 0
@@ -703,9 +721,11 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._direct_switch_timer_id = None
         self._active_media = None
         self._active_source = None
+        self._at_eos = False
         self._fit_mode = "cover"
         self._playback_rate = 1.0
         self._rate_applied = False
+        self._applied_rate = 1.0
         self._rate_apply_source_id = None
         self._adjust_apply_source_id = None
         self._last_dimensions = (None, None)
@@ -717,6 +737,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self.connect("button-press-event", self._on_button_press_event)
         self.connect("configure-event", self._on_configure_event)
 
+        self._watch_player_bus()
+
+    def _watch_player_bus(self):
         self._bus = self._player.get_bus()
         if self._bus is not None:
             self._bus.add_signal_watch()
@@ -946,18 +969,22 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         state = self._query_state()
         if state not in {Gst.State.PAUSED, Gst.State.PLAYING}:
             return False
+        if self._playback_rate == self._applied_rate:
+            self._rate_applied = True
+            return False
         position = self._query_position_ns()
         try:
-            self._player.seek(
+            self._rate_applied = self._player.seek(
                 self._playback_rate,
                 Gst.Format.TIME,
                 Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
                 Gst.SeekType.SET,
                 position,
                 Gst.SeekType.NONE,
-                Gst.CLOCK_TIME_NONE,
+                -1,
             )
-            self._rate_applied = True
+            if self._rate_applied:
+                self._applied_rate = self._playback_rate
         except Exception as e:
             logger.debug(f"[Gst] Could not apply playback rate={self._playback_rate}: {e}")
         return False
@@ -1028,6 +1055,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def play(self):
         if self._active_media is None:
             return
+        if self._at_eos:
+            self._rewind_current_media()
         self._player.set_state(Gst.State.PLAYING)
         self._schedule_rate_apply()
         self._schedule_adjustment_reapply()
@@ -1041,7 +1070,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
                         fade_interval=fade_interval, update_callback=self.set_volume)
 
     def is_playing(self):
-        return self._query_state() == Gst.State.PLAYING
+        return not self._at_eos and self._query_state() == Gst.State.PLAYING
 
     def pause(self):
         if self._active_media is None:
@@ -1064,6 +1093,11 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
 
     def media_new(self, source):
         return GstMedia(source, self._video_adjustments)
+
+    def update_media_options(self, loop_video, disable_audio):
+        self._active_media.loop_video = loop_video
+        self._active_media.disable_audio = disable_audio
+        self._apply_current_audio_flags()
 
     def set_media(self, media, source=None):
         if media is None:
@@ -1098,6 +1132,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             else getattr(media, "original_source", media.source)
         )
         self._rate_applied = False
+        self._applied_rate = 1.0
+        self._at_eos = False
         self._apply_current_audio_flags()
         return True
 
@@ -1114,8 +1150,7 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         video_height=None,
         disable_audio=False,
     ):
-        self._cancel_queued_gpu_preparation()
-        self._queued_prepare_generation += 1
+        self.clear_queued_media()
         if disable_audio:
             media.disable_audio = True
         self._queued_media = media
@@ -1203,9 +1238,88 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         return False
 
     def queued_ready(self):
-        # Keep the current frame visible while unsupported codecs are prepared
-        # off the GTK loop for the GPU-backed handoff.
-        return self._queued_media is not None and not self._queued_preparing
+        media = self._queued_media
+        if media is None or self._queued_preparing:
+            return False
+        if not self._gpu_native_sink or self._preroll_failed or media.gpu_preparation_failed:
+            return True
+        if self._queued_preroll is None:
+            decoder = _gpu_decoder_for_source(media.source, self._video_adjustments)
+            if not decoder:
+                return True
+            self._start_preroll(media, decoder)
+        preroll = self._queued_preroll
+        if preroll is None:
+            return True
+        result, state, _ = preroll.player.get_state(0)
+        if result == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PAUSED:
+            return True
+        if result == Gst.StateChangeReturn.FAILURE or time.monotonic() >= preroll.deadline:
+            self._discard_preroll()
+            self._preroll_failed = True
+            return True
+        return False
+
+    def _start_preroll(self, media, decoder):
+        # Keep the old child above the new one until the GPU sink has drawn
+        # its first frame. Only allocate the spare pipeline near the handoff.
+        sink, widget, native = _new_gpu_sink_and_widget(self.width, self.height)
+        video_filter, balance, _ = _build_gpu_filter_bin()
+        player = Gst.ElementFactory.make("playbin")
+        if not native or video_filter is None or player is None:
+            self._preroll_failed = True
+            return
+        player.set_property("video-sink", sink)
+        player.set_property("video-filter", video_filter)
+        player.set_property("mute", True)
+        player.set_property("uri", self._source_to_uri(media.source))
+        self._viewport.put(widget, 0, 0)
+        widget.show()
+        native_window = widget.get_window()
+        if native_window is None:
+            self._viewport.remove(widget)
+            self._preroll_failed = True
+            return
+        native_window.lower()
+        self._layout_native_video(widget, sink, *self._queued_dimensions)
+        self._queued_preroll = _Preroll(
+            player, sink, widget, video_filter, balance, decoder,
+            time.monotonic() + 3,
+        )
+        if player.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
+            self._discard_preroll()
+            self._preroll_failed = True
+
+    def _discard_preroll(self):
+        preroll = self._queued_preroll
+        self._queued_preroll = None
+        if preroll is not None:
+            preroll.player.set_state(Gst.State.NULL)
+            self._viewport.remove(preroll.widget)
+
+    def _activate_preroll(self, preroll, media, source):
+        old_player, old_widget = self._player, self._video_widget
+        volume = self.get_volume()
+        self._bus.remove_signal_watch()
+        self._player = preroll.player
+        self._sink = preroll.sink
+        self._video_widget = preroll.widget
+        self._video_filter = self._gpu_filter = preroll.video_filter
+        self._video_balance = preroll.balance
+        self._gpu_decoder = preroll.decoder
+        self._active_media, self._active_source = media, source
+        self._rate_applied = False
+        self._applied_rate = 1.0
+        self._at_eos = False
+        self._watch_player_bus()
+        self.set_volume(volume)
+        self._apply_current_audio_flags()
+        self.apply_video_adjustments(self._video_adjustments)
+        preroll.widget.get_window().raise_()
+        preroll.widget.get_display().flush()
+        GstVideo.VideoOverlay.expose(preroll.sink)
+        old_player.set_state(Gst.State.NULL)
+        self._viewport.remove(old_widget)
 
     def queued_preload_failed(self):
         return False
@@ -1230,13 +1344,15 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         if not self._direct_switch_pending:
             self._direct_switch_timer_id = None
             return False
-        if self._queued_preparing:
+        app = self.get_application()
+        should_play = app._should_playback_start() if app else self._direct_switch_should_play
+        if not self.queued_ready():
+            if should_play and self._at_eos:
+                self.keep_current_media_playing()
             return True
         self._direct_switch_timer_id = None
         callback = getattr(self, "_direct_switch_callback", None)
-        result = self.switch_to_queued_media(
-            should_play=getattr(self, "_direct_switch_should_play", True)
-        )
+        result = self.switch_to_queued_media(should_play=should_play)
         self._direct_switch_callback = None
         if result[0] and callback is not None:
             try:
@@ -1257,6 +1373,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
     def clear_queued_media(self):
         self._queued_prepare_generation += 1
         self._cancel_queued_gpu_preparation()
+        self._discard_preroll()
+        self._preroll_failed = False
         if self._direct_switch_timer_id is not None:
             try:
                 GLib.source_remove(self._direct_switch_timer_id)
@@ -1272,15 +1390,19 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_dimensions = (None, None)
 
     def switch_to_queued_media(self, should_play=True, allow_unprepared=False):
-        if not self._queued_media:
+        if not self.queued_ready():
             return None, None, None
         media = self._queued_media
         source = self._queued_source
         base_source = self._queued_base if self._queued_base else source
         phase = self._queued_phase
         video_width, video_height = self._queued_dimensions
+        preroll = self._queued_preroll
+        self._queued_preroll = None
         self.clear_queued_media()
-        if self.set_media(media, source=source) is False:
+        if preroll is not None:
+            self._activate_preroll(preroll, media, source)
+        elif self.set_media(media, source=source) is False:
             self.keep_current_media_playing()
             return None, None, None
         self.schedule_centercrop(video_width, video_height)
@@ -1295,10 +1417,24 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         if self._active_media is None:
             return
         try:
-            if self._query_state() in {Gst.State.NULL, Gst.State.READY, Gst.State.PAUSED}:
+            if self._at_eos:
+                self._rewind_current_media()
+            if self._query_state() != Gst.State.PLAYING:
                 self._player.set_state(Gst.State.PLAYING)
         except Exception as e:
             logger.debug(f"[Gst] Could not keep current media playing: {e}")
+
+    def _rewind_current_media(self):
+        # The seek stop parameter is signed. CLOCK_TIME_NONE is unsigned
+        # and PyGObject rejects it before the seek reaches GStreamer.
+        if self._player.seek(
+            self._playback_rate, Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, Gst.SeekType.SET, 0,
+            Gst.SeekType.NONE, -1,
+        ):
+            self._at_eos = False
+            self._rate_applied = True
+            self._applied_rate = self._playback_rate
 
     def set_volume(self, volume):
         try:
@@ -1367,63 +1503,42 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             return False
 
         self._last_dimensions = (video_width, video_height)
+        if self._gpu_native_sink:
+            self._layout_native_video(self._video_widget, self._sink, video_width, video_height)
+        else:
+            geometry = calculate_fit_geometry(
+                self.width, self.height, video_width, video_height, self._fit_mode,
+            )
+            self._video_widget.set_size_request(geometry.width, geometry.height)
+            self._viewport.move(self._video_widget, geometry.x, geometry.y)
+        # This method is also a one-shot GLib idle callback.
+        return False
+
+    def _layout_native_video(self, widget, sink, video_width, video_height):
         geometry = calculate_fit_geometry(
             self.width,
             self.height,
-            video_width,
-            video_height,
+            video_width or self.width,
+            video_height or self.height,
             self._fit_mode,
         )
-        if self._gpu_native_sink and self._fit_mode == "cover":
-            # Keep GTK's allocation at monitor size so its top-level window
-            # cannot grow to the cover-scaled video width.  Resize and offset
-            # the native X11 child after allocation; the parent then clips the
-            # centered video to the monitor bounds.
-            self._video_widget._wallblazer_render_rectangle = (
-                0,
-                0,
-                geometry.width,
-                geometry.height,
+        widget.set_size_request(self.width, self.height)
+        self._viewport.move(widget, 0, 0)
+        if self._fit_mode == "cover":
+            # The GTK top-level stays monitor-sized. X11 clips the oversized
+            # child to the parent, keeping the video centered on portrait displays.
+            widget._wallblazer_render_rectangle = (0, 0, geometry.width, geometry.height)
+            widget._wallblazer_native_geometry = (
+                geometry.x, geometry.y, geometry.width, geometry.height,
             )
-            self._video_widget._wallblazer_native_geometry = (
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-            )
-            self._video_widget.set_size_request(self.width, self.height)
-            try:
-                self._viewport.move(self._video_widget, 0, 0)
-            except Exception:
-                return False
-            _schedule_native_gl_window_move(self._video_widget)
-            _update_native_gl_render_rectangle(self._sink, self._video_widget)
-        elif self._gpu_native_sink:
-            # The native child stays anchored to its monitor for contain and
-            # stretch; the positive fitted rectangle adds contain margins.
-            self._video_widget._wallblazer_native_geometry = None
-            self._video_widget._wallblazer_render_rectangle = (
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-            )
-            self._video_widget.set_size_request(self.width, self.height)
-            try:
-                self._viewport.move(self._video_widget, 0, 0)
-            except Exception:
-                return False
-            _update_native_gl_render_rectangle(self._sink, self._video_widget)
+            _schedule_native_gl_window_move(widget)
         else:
-            self._video_widget.set_size_request(geometry.width, geometry.height)
-            try:
-                self._viewport.move(self._video_widget, geometry.x, geometry.y)
-            except Exception:
-                return False
-        # schedule_centercrop uses this method as a GLib idle callback. A
-        # successful crop is complete work; returning True would make GLib
-        # invoke it forever and consume a full CPU core.
-        return False
+            widget._wallblazer_native_geometry = None
+            widget._wallblazer_render_rectangle = (geometry.x, geometry.y, geometry.width, geometry.height)
+            window = widget.get_window()
+            if window is not None:
+                _move_resize_native_gl_window(window, (0, 0, self.width, self.height))
+        _update_native_gl_render_rectangle(sink, widget)
 
     def schedule_centercrop(self, video_width=None, video_height=None, attempts=1, delay_ms=0):
         if video_width is not None and video_height is not None:
@@ -1454,14 +1569,10 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             err, debug = message.parse_error()
             logger.error(f"[Gst] Playback error: {err} debug={debug}")
         elif msg_type == Gst.MessageType.EOS:
+            self._at_eos = True
             if self._active_media is not None and self._active_media.loop_video and self._queued_media is None:
                 try:
-                    self._player.seek_simple(
-                        Gst.Format.TIME,
-                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                        0,
-                    )
-                    self._player.set_state(Gst.State.PLAYING)
+                    self.keep_current_media_playing()
                 except Exception as e:
                     logger.warning(f"[Gst] Could not loop playback: {e}")
             elif self._notify_end_reached():
@@ -1531,6 +1642,13 @@ class GstVideoPlayer(VideoPlayer):
     </interface>
     </node>
     """
+
+    @property
+    def is_playing(self):
+        return bool(self.windows) and all(
+            window is not None and window.is_playing()
+            for window in self.windows.values()
+        )
 
     def _gpu_decoder_for_monitor(self, gdk_monitor):
         data_source = self.config.get(CONFIG_KEY_DATA_SOURCE, {})

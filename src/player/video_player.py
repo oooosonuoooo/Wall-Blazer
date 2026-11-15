@@ -1255,6 +1255,7 @@ class VideoPlayer(BasePlayer):
         self.is_paused_by_user = False
         self._playlist_monitor_timers = {}
         self._playlist_switching_monitors = set()
+        self._playlist_advance_requested = set()
         self._video_dimension_cache = {}
         self._video_dimension_inflight = set()
         self._reverse_state = {}
@@ -1705,6 +1706,7 @@ class VideoPlayer(BasePlayer):
                 pass
         self._playlist_monitor_timers.clear()
         self._playlist_switching_monitors.clear()
+        self._playlist_advance_requested.clear()
         for window in self.windows.values():
             if window:
                 window.clear_queued_media()
@@ -1843,6 +1845,8 @@ class VideoPlayer(BasePlayer):
         # this is what prevents the black/stuck gap at the old transition point.
         if not window.queued_ready():
             if not window.queued_preload_failed():
+                if monitor_name in self._playlist_monitor_timers:
+                    self._playlist_advance_requested.add(monitor_name)
                 window.keep_current_media_playing()
                 self._trace_transition(
                     "waiting_for_preload",
@@ -1870,6 +1874,7 @@ class VideoPlayer(BasePlayer):
             )
             if not switched_source:
                 return
+            self._playlist_advance_requested.discard(monitor_name)
             if switched_base:
                 self._startup_playback_pending.pop(monitor_name, None)
                 self._reverse_state[monitor_name] = {
@@ -2049,6 +2054,9 @@ class VideoPlayer(BasePlayer):
         if self._startup_playback_is_pending(
             monitor_name, window, "startup_waiting_for_playback"
         ):
+            return True
+        if monitor_name in self._playlist_advance_requested:
+            self._transition_to_queued_media(monitor, window)
             return True
         settle_until = self._playback_settle_until.get(monitor_name, 0.0)
         if settle_until > time.monotonic():
@@ -2251,6 +2259,11 @@ class VideoPlayer(BasePlayer):
                     f"(loop={loop_video}, reverse={reverse_active}, "
                     f"smooth={'yes' if current_source and not same_source else 'no'})"
                 )
+                update_options = getattr(window, "update_media_options", None)
+                if same_source and update_options is not None:
+                    update_options(loop_video, disable_audio=not monitor.is_primary())
+                    self._apply_window_profile(monitor, window, "forward")
+                    continue
                 media = self._create_video_media(
                     window=window,
                     source=base_source,
@@ -2406,6 +2419,8 @@ class VideoPlayer(BasePlayer):
         if self.mode != MODE_VIDEO or not bool(self.config.get(CONFIG_KEY_PLAYLIST, False)):
             return
         for monitor, window in self.windows.items():
+            if monitor.get_model() in self._playlist_monitor_timers:
+                self._playlist_advance_requested.add(monitor.get_model())
             self._transition_to_queued_media(monitor, window)
 
     def apply_video_config(self):

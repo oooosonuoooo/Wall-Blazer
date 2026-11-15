@@ -73,8 +73,7 @@ class PreloadTransitionTests(unittest.TestCase):
     def test_gstreamer_queue_media_accepts_audio_policy(self):
         media = SimpleNamespace(disable_audio=False)
         window = SimpleNamespace(
-            _cancel_queued_gpu_preparation=Mock(),
-            _queued_prepare_generation=0,
+            clear_queued_media=Mock(),
         )
 
         gst_video_player.GstPlayerWindow.queue_media(
@@ -94,6 +93,43 @@ class PreloadTransitionTests(unittest.TestCase):
         self.assertEqual(window._queued_base, "/tmp/base.mp4")
         self.assertEqual(window._queued_phase, "forward")
         self.assertEqual(window._queued_dimensions, (1920, 1080))
+
+    def test_gstreamer_waits_for_the_prerolled_first_frame(self):
+        gst = gst_video_player.Gst
+        player = Mock()
+        player.get_state.side_effect = [
+            (gst.StateChangeReturn.ASYNC, gst.State.READY, gst.State.PAUSED),
+            (gst.StateChangeReturn.SUCCESS, gst.State.PAUSED, gst.State.VOID_PENDING),
+        ]
+        window = SimpleNamespace(
+            _queued_media=SimpleNamespace(gpu_preparation_failed=False),
+            _queued_preparing=False,
+            _gpu_native_sink=True,
+            _preroll_failed=False,
+            _queued_preroll=SimpleNamespace(player=player, deadline=float("inf")),
+        )
+        self.assertFalse(gst_video_player.GstPlayerWindow.queued_ready(window))
+        self.assertTrue(gst_video_player.GstPlayerWindow.queued_ready(window))
+
+    def test_gstreamer_rewinds_an_ended_clip_while_the_next_clip_prepares(self):
+        gst = gst_video_player.Gst
+        player = Mock()
+        player.seek.return_value = True
+        window = SimpleNamespace(
+            _active_media=object(),
+            _at_eos=True,
+            _player=player,
+            _playback_rate=1.25,
+            _query_state=lambda: gst.State.PLAYING,
+        )
+        window._rewind_current_media = lambda: gst_video_player.GstPlayerWindow._rewind_current_media(window)
+        self.assertFalse(gst_video_player.GstPlayerWindow.is_playing(window))
+        gst_video_player.GstPlayerWindow.keep_current_media_playing(window)
+        player.seek.assert_called_once_with(
+            1.25, gst.Format.TIME, gst.SeekFlags.FLUSH | gst.SeekFlags.KEY_UNIT,
+            gst.SeekType.SET, 0, gst.SeekType.NONE, -1,
+        )
+        self.assertTrue(gst_video_player.GstPlayerWindow.is_playing(window))
 
     def test_queue_media_starts_a_gpu_preload_with_audio_policy(self):
         start_preload = Mock()
