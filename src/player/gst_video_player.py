@@ -527,6 +527,8 @@ class GstMedia:
         self.original_source = source
         self.source = get_gpu_playback_source(source)
         self.gpu_preparation_failed = False
+        self.gpu_preparation_required = False
+        self.gpu_prepared = not is_usable_video_path(source)
         self.loop_video = False
         self.disable_audio = False
 
@@ -547,33 +549,44 @@ class GstMedia:
                 return
 
         if _gpu_decoder_for_source(self.source, adjustments):
+            self.gpu_prepared = True
             if self.source != source:
                 logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
             return
 
-        if (
+        self.gpu_preparation_required = bool(
             is_usable_video_path(source)
             and _gpu_compatibility_preparation_enabled(adjustments)
-        ):
-            result = prepare_gpu_playback_video(source)
-            prepared_source = get_gpu_playback_source(source) if result.get("ok") else source
-            if result.get("ok") and _gpu_decoder_for_source(prepared_source, adjustments):
-                self.source = prepared_source
-                logger.info("[Gst] Prepared the next playlist video for NVDEC")
-            else:
-                self.gpu_preparation_failed = True
-                failure_reason = (
-                    result.get("error") or "NVDEC-compatible cache unavailable"
-                )
-                if failure_key:
-                    with _GPU_PREPARATION_FAILURES_LOCK:
-                        _GPU_PREPARATION_FAILURES[failure_key] = failure_reason
-                logger.error(
-                    "[Gst] Skipping an unsupported playlist video rather than decoding it on the CPU: %s",
-                    failure_reason,
-                )
+        )
         if self.source != source:
             logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
+
+    def apply_gpu_preparation_result(self, result, adjustments=None):
+        """Apply an asynchronously prepared NVDEC-compatible copy."""
+        if result.get("ok"):
+            prepared_source = get_gpu_playback_source(self.original_source)
+            if _gpu_decoder_for_source(prepared_source, adjustments):
+                self.source = prepared_source
+                self.gpu_prepared = True
+                self.gpu_preparation_required = False
+                logger.info("[Gst] Prepared the next playlist video for NVDEC")
+                return True
+
+        self.gpu_preparation_failed = True
+        failure_reason = result.get("error") or "NVDEC-compatible cache unavailable"
+        failure_key = (
+            os.path.normcase(os.path.realpath(os.path.expanduser(self.original_source)))
+            if isinstance(self.original_source, str)
+            else None
+        )
+        if failure_key:
+            with _GPU_PREPARATION_FAILURES_LOCK:
+                _GPU_PREPARATION_FAILURES[failure_key] = failure_reason
+        logger.error(
+            "[Gst] Skipping an unsupported playlist video rather than decoding it on the CPU: %s",
+            failure_reason,
+        )
+        return False
     def add_option(self, option):
         if not isinstance(option, str):
             return
@@ -681,6 +694,10 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_phase = "forward"
         self._queued_dimensions = (None, None)
         self._direct_switch_pending = False
+        self._queued_preparing = False
+        self._queued_prepare_generation = 0
+        self._queued_prepare_cancel_event = None
+        self._direct_switch_timer_id = None
         self._active_media = None
         self._active_source = None
         self._fit_mode = "cover"
@@ -1051,6 +1068,12 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         if getattr(media, "gpu_preparation_failed", False):
             logger.warning("[Gst] Keeping the current wallpaper; refusing CPU playback fallback")
             return False
+        if (
+            getattr(media, "gpu_preparation_required", False)
+            and not getattr(media, "gpu_prepared", False)
+        ):
+            logger.warning("[Gst] Keeping the current wallpaper until GPU preparation completes")
+            return False
         self._switch_render_path(
             _gpu_decoder_for_source(media.source, self._video_adjustments)
         )
@@ -1088,6 +1111,8 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         video_height=None,
         disable_audio=False,
     ):
+        self._cancel_queued_gpu_preparation()
+        self._queued_prepare_generation += 1
         if disable_audio:
             media.disable_audio = True
         self._queued_media = media
@@ -1095,12 +1120,72 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_base = base_source if base_source else source
         self._queued_phase = phase
         self._queued_dimensions = (video_width, video_height)
+        if getattr(media, "gpu_preparation_required", False) and not getattr(
+            media, "gpu_prepared", False
+        ):
+            self._start_queued_gpu_preparation(media, self._queued_prepare_generation)
+
+    def _cancel_queued_gpu_preparation(self):
+        cancel_event = self._queued_prepare_cancel_event
+        self._queued_prepare_cancel_event = None
+        self._queued_preparing = False
+        if cancel_event is not None:
+            cancel_event.set()
+
+    def _start_queued_gpu_preparation(self, media, generation):
+        cancel_event = threading.Event()
+        self._queued_prepare_cancel_event = cancel_event
+        self._queued_preparing = True
+
+        def _worker():
+            try:
+                result = prepare_gpu_playback_video(
+                    media.original_source,
+                    cancel_event=cancel_event,
+                )
+            except Exception as error:
+                logger.exception("[GPU cache] Playlist video preparation failed")
+                result = {
+                    "ok": False,
+                    "cancelled": cancel_event.is_set(),
+                    "error": str(error),
+                }
+            GLib.idle_add(
+                self._finish_queued_gpu_preparation,
+                media,
+                generation,
+                cancel_event,
+                result,
+            )
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="wallblazer-playlist-gpu-prep",
+        ).start()
+        logger.info(
+            "[GPU cache] Preparing the next playlist video in the background: %s",
+            os.path.basename(media.original_source),
+        )
+
+    def _finish_queued_gpu_preparation(
+        self, media, generation, cancel_event, result
+    ):
+        if (
+            generation != self._queued_prepare_generation
+            or cancel_event is not self._queued_prepare_cancel_event
+        ):
+            return False
+        self._queued_prepare_cancel_event = None
+        self._queued_preparing = False
+        if not cancel_event.is_set():
+            media.apply_gpu_preparation_result(result, self._video_adjustments)
+        return False
 
     def queued_ready(self):
-        # GStreamer keeps one live playbin.  A queued item is ready for the
-        # compatibility handoff as soon as its metadata is available; the
-        # current frame remains visible until the idle callback promotes it.
-        return self._queued_media is not None
+        # Keep the current frame visible while unsupported codecs are prepared
+        # off the GTK loop for the GPU-backed handoff.
+        return self._queued_media is not None and not self._queued_preparing
 
     def queued_preload_failed(self):
         return False
@@ -1113,19 +1198,32 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
             return False
         self._direct_switch_pending = True
 
-        def _switch():
-            if not self._direct_switch_pending:
-                return False
-            result = self.switch_to_queued_media(should_play=should_play)
-            if result[0] and callback is not None:
-                try:
-                    callback(*result)
-                except Exception as e:
-                    logger.warning(f"[Gst] Direct source callback failed: {e}")
-            return False
-
-        GLib.idle_add(_switch)
+        self._direct_switch_should_play = bool(should_play)
+        self._direct_switch_callback = callback
+        if self._direct_switch_timer_id is None:
+            self._direct_switch_timer_id = GLib.timeout_add(
+                100, self._perform_direct_queued_switch
+            )
         return True
+
+    def _perform_direct_queued_switch(self):
+        if not self._direct_switch_pending:
+            self._direct_switch_timer_id = None
+            return False
+        if self._queued_preparing:
+            return True
+        self._direct_switch_timer_id = None
+        callback = getattr(self, "_direct_switch_callback", None)
+        result = self.switch_to_queued_media(
+            should_play=getattr(self, "_direct_switch_should_play", True)
+        )
+        self._direct_switch_callback = None
+        if result[0] and callback is not None:
+            try:
+                callback(*result)
+            except Exception as e:
+                logger.warning(f"[Gst] Direct source callback failed: {e}")
+        return False
 
     def queued_source(self):
         return self._queued_source
@@ -1137,7 +1235,16 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         return self._queued_phase
 
     def clear_queued_media(self):
+        self._queued_prepare_generation += 1
+        self._cancel_queued_gpu_preparation()
+        if self._direct_switch_timer_id is not None:
+            try:
+                GLib.source_remove(self._direct_switch_timer_id)
+            except Exception:
+                pass
+            self._direct_switch_timer_id = None
         self._direct_switch_pending = False
+        self._direct_switch_callback = None
         self._queued_media = None
         self._queued_source = None
         self._queued_base = None
