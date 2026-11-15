@@ -65,6 +65,7 @@ _GPU_FILTER_ELEMENTS = ("videorate", "glcolorconvert", "glcolorbalance")
 _GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
 _GPU_PREPARATION_FAILURES = {}
 _GPU_PREPARATION_FAILURES_LOCK = threading.Lock()
+_GPU_PLAYLIST_PREPARATION_SEMAPHORE = threading.BoundedSemaphore(1)
 _X11_LIBRARY = None
 _X11_DISPLAY = None
 
@@ -1138,11 +1139,25 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self._queued_preparing = True
 
         def _worker():
+            acquired = False
             try:
-                result = prepare_gpu_playback_video(
-                    media.original_source,
-                    cancel_event=cancel_event,
-                )
+                while not cancel_event.is_set():
+                    acquired = _GPU_PLAYLIST_PREPARATION_SEMAPHORE.acquire(
+                        timeout=0.25
+                    )
+                    if acquired:
+                        break
+                if cancel_event.is_set():
+                    result = {
+                        "ok": False,
+                        "cancelled": True,
+                        "error": "preparation cancelled",
+                    }
+                else:
+                    result = prepare_gpu_playback_video(
+                        media.original_source,
+                        cancel_event=cancel_event,
+                    )
             except Exception as error:
                 logger.exception("[GPU cache] Playlist video preparation failed")
                 result = {
@@ -1150,6 +1165,9 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
                     "cancelled": cancel_event.is_set(),
                     "error": str(error),
                 }
+            finally:
+                if acquired:
+                    _GPU_PLAYLIST_PREPARATION_SEMAPHORE.release()
             GLib.idle_add(
                 self._finish_queued_gpu_preparation,
                 media,

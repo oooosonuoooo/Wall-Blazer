@@ -548,7 +548,7 @@ def _ffmpeg_run_quiet(args, timeout=None, low_priority=True, cancel_event=None):
     if low_priority and sys.platform != "win32":
         def _lower_priority():
             try:
-                os.nice(15)
+                os.nice(19)
             except OSError:
                 pass
         run_kwargs["preexec_fn"] = _lower_priority
