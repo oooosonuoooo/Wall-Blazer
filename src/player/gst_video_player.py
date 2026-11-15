@@ -4,6 +4,7 @@ import ctypes.util
 import os
 import pathlib
 import sys
+import threading
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -24,14 +25,26 @@ try:
     from menu import build_menu
     from player.fit_geometry import calculate_fit_geometry, normalize_fit_mode
     from player.video_player import VideoPlayer
-    from utils import get_gpu_playback_source, get_vlc_hwdec_profile, probe_media_info
+    from utils import (
+        get_gpu_playback_source,
+        get_vlc_hwdec_profile,
+        is_usable_video_path,
+        prepare_gpu_playback_video,
+        probe_media_info,
+    )
 except (ModuleNotFoundError, ImportError):
     from wallblazer.commons import *
     from wallblazer.ipc import publish_service
     from wallblazer.menu import build_menu
     from wallblazer.player.fit_geometry import calculate_fit_geometry, normalize_fit_mode
     from wallblazer.player.video_player import VideoPlayer
-    from wallblazer.utils import get_gpu_playback_source, get_vlc_hwdec_profile, probe_media_info
+    from wallblazer.utils import (
+        get_gpu_playback_source,
+        get_vlc_hwdec_profile,
+        is_usable_video_path,
+        prepare_gpu_playback_video,
+        probe_media_info,
+    )
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -50,6 +63,8 @@ _GPU_DECODER_FACTORIES = {
 # drop-only, so it throttles a 60 fps wallpaper without touching pixel memory.
 _GPU_FILTER_ELEMENTS = ("videorate", "glcolorconvert", "glcolorbalance")
 _GPU_RENDER_SINKS = ("glimagesink", "gtkglsink")
+_GPU_PREPARATION_FAILURES = {}
+_GPU_PREPARATION_FAILURES_LOCK = threading.Lock()
 _X11_LIBRARY = None
 _X11_DISPLAY = None
 
@@ -326,6 +341,32 @@ def _gpu_decoder_for_source(source, adjustments=None):
     return decoder_name
 
 
+def _gpu_compatibility_preparation_enabled(adjustments=None):
+    """Return whether unsupported local media may be cached for NVDEC."""
+    if not _gpu_adjustments_allow_path(adjustments):
+        return False
+    if str(os.environ.get("WALLBLAZER_GPU_FILTERS", "auto")).strip().lower() in {
+        "0", "false", "off", "no",
+    }:
+        return False
+    if str(os.environ.get("WALLBLAZER_FORCE_HWDEC", "")).strip().lower() == "none":
+        return False
+    if "WALLBLAZER_GPU_COMPAT_PREPARE" in os.environ:
+        if not _is_truthy_env("WALLBLAZER_GPU_COMPAT_PREPARE"):
+            return False
+
+    if get_vlc_hwdec_profile().get("hwdec") != "cuda":
+        return False
+    if any(Gst.ElementFactory.find(name) is None for name in _GPU_FILTER_ELEMENTS):
+        return False
+    if not any(Gst.ElementFactory.find(name) is not None for name in _GPU_RENDER_SINKS):
+        return False
+    return any(
+        Gst.ElementFactory.find(name) is not None
+        for name in _GPU_DECODER_FACTORIES.values()
+    )
+
+
 def _build_gpu_filter_bin():
     """Build a direct NVDEC-GL color path for NVIDIA-decoded video frames."""
     rate = Gst.ElementFactory.make("videorate", None)
@@ -482,14 +523,57 @@ class ColorTintOverlay(Gtk.DrawingArea):
 
 
 class GstMedia:
-    def __init__(self, source):
+    def __init__(self, source, adjustments=None):
         self.original_source = source
         self.source = get_gpu_playback_source(source)
-        if self.source != source:
-            logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
+        self.gpu_preparation_failed = False
         self.loop_video = False
         self.disable_audio = False
 
+        failure_key = (
+            os.path.normcase(os.path.realpath(os.path.expanduser(source)))
+            if isinstance(source, str)
+            else None
+        )
+        if failure_key:
+            with _GPU_PREPARATION_FAILURES_LOCK:
+                failure_reason = _GPU_PREPARATION_FAILURES.get(failure_key)
+            if failure_reason is not None:
+                self.gpu_preparation_failed = True
+                logger.warning(
+                    "[Gst] Skipping a playlist video whose GPU preparation already failed: %s",
+                    failure_reason,
+                )
+                return
+
+        if _gpu_decoder_for_source(self.source, adjustments):
+            if self.source != source:
+                logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
+            return
+
+        if (
+            is_usable_video_path(source)
+            and _gpu_compatibility_preparation_enabled(adjustments)
+        ):
+            result = prepare_gpu_playback_video(source)
+            prepared_source = get_gpu_playback_source(source) if result.get("ok") else source
+            if result.get("ok") and _gpu_decoder_for_source(prepared_source, adjustments):
+                self.source = prepared_source
+                logger.info("[Gst] Prepared the next playlist video for NVDEC")
+            else:
+                self.gpu_preparation_failed = True
+                failure_reason = (
+                    result.get("error") or "NVDEC-compatible cache unavailable"
+                )
+                if failure_key:
+                    with _GPU_PREPARATION_FAILURES_LOCK:
+                        _GPU_PREPARATION_FAILURES[failure_key] = failure_reason
+                logger.error(
+                    "[Gst] Skipping an unsupported playlist video rather than decoding it on the CPU: %s",
+                    failure_reason,
+                )
+        if self.source != source:
+            logger.info("[Gst] Using a cached H.264 copy for NVDEC playback")
     def add_option(self, option):
         if not isinstance(option, str):
             return
@@ -959,10 +1043,13 @@ class GstPlayerWindow(Gtk.ApplicationWindow):
         self.fade.start(cur=cur, target=target, step=step, fade_interval=fade_interval, update_callback=self.set_volume)
 
     def media_new(self, source):
-        return GstMedia(source)
+        return GstMedia(source, self._video_adjustments)
 
     def set_media(self, media, source=None):
         if media is None:
+            return False
+        if getattr(media, "gpu_preparation_failed", False):
+            logger.warning("[Gst] Keeping the current wallpaper; refusing CPU playback fallback")
             return False
         self._switch_render_path(
             _gpu_decoder_for_source(media.source, self._video_adjustments)
